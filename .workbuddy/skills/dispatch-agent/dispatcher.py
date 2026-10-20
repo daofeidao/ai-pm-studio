@@ -40,6 +40,7 @@ from pm_common import (
 from git_ops import GitOps
 from quota import QuotaService
 import agent_provider as ap
+from activity import ActivityLog
 from agent_provider import (
     AgentProvider,
     AgentResult,
@@ -150,14 +151,20 @@ class Dispatcher:
         git: GitOps,
         demo: bool = False,
         demo_irreversible: bool = False,
+        demo_escape_write: bool = False,
+        demo_agent_fail: bool = False,
+        demo_quota_percent: float | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.cfg = cfg
         self.git = git
         self.demo = demo or bool(cfg.get("demo", {}).get("enabled", False))
         self.demo_irreversible = demo_irreversible
+        self.demo_escape_write = demo_escape_write
+        self.demo_agent_fail = demo_agent_fail
         self.router = ScriptRouter(self.root, cfg)
-        self.quota = QuotaService(cfg, demo=self.demo)
+        self.quota = QuotaService(cfg, demo=self.demo, demo_percent=demo_quota_percent)
+        self.activity = ActivityLog(self.root, "activity.jsonl")
         self.max_rework = int(cfg.get("loop", {}).get("max_rework", 2))
         self.degrade_percent = float(cfg.get("quota", {}).get("degrade_percent", 90))
         self.last_route: str | None = None      # script / workbuddy / opencode
@@ -181,7 +188,12 @@ class Dispatcher:
         if kind == "opencode":
             if self.demo:
                 return MockOpenCodeProvider(
-                    self.root, self.cfg, self.git, irreversible=self.demo_irreversible
+                    self.root,
+                    self.cfg,
+                    self.git,
+                    irreversible=self.demo_irreversible,
+                    escape_write=self.demo_escape_write,
+                    agent_fail=self.demo_agent_fail,
                 )
             return OpenCodeProvider(self.root, self.cfg, self.git)
         raise PMError(E_SCRIPT_NOT_FOUND, f"未知 provider: {kind}")
@@ -204,7 +216,8 @@ class Dispatcher:
     _REVERSE_EXTS = (".asar", ".apk", ".dll", ".elf", ".exe", ".bin", ".img",
                      ".dex", ".so", ".dylib", ".app", ".ipa", "firmware")
     _REVERSE_KEYWORDS = ("逆向", "反编译", "解包", "reverse", "decompile",
-                         "electron", "固件", "binary analysis", "mach-o", "逆向工程")
+                         "electron", "固件", "binary analysis", "mach-o", "逆向工程",
+                         "二进制", "app.asar", "elf")
 
     def _extract_path_tokens(self, instruction: str) -> list[str]:
         """从指令里按空白/引号切出疑似文件路径的 token（鲁棒，兼容 8.3 短路径）。"""
@@ -243,6 +256,7 @@ class Dispatcher:
         if not is_rev:
             return instruction
         self.reverse_loaded = True
+        self.activity.reverse(True, target or "", "")
         if target:
             self.reverse_targets = [target]
         if self._reverse_prepared:
@@ -267,6 +281,8 @@ class Dispatcher:
                 copied.append(str(dest.relative_to(self.root)))
         self.reverse_copied_to = copied
         self._reverse_prepared = True
+        if copied:
+            self.activity.reverse(True, target or "", "、".join(copied))
         inj = (
             "请先读取 .opencode/skills/leanrea/SKILL.md，按其「路由表」为本次逆向目标选择首条命令；"
             "务必先把目标文件复制到 worktree 副本（worktrees/%s/_reverse/copy/）再对副本操作，"
@@ -363,8 +379,24 @@ class Dispatcher:
 
         # ② 额度超限降级 WB
         quota = self.quota.fetch()
+        # 额度查询失败（stale）-> **不拦截**，但记 quota_check_failed（可审计）
+        self.activity.quota(
+            quota.max_percent,
+            quota.stale,
+            quota.source,
+            decision="quota_check_failed" if quota.stale else "",
+        )
+        if quota.stale:
+            print(
+                f"[PM] 额度查询失败（stale，source={quota.source}）-> 记 quota_check_failed，"
+                "不拦截，继续派活"
+            )
         if not quota.stale and quota.max_percent > self.degrade_percent:
             self.last_route = "workbuddy"
+            print(
+                f"[PM] 额度 {quota.max_percent:g}% > {self.degrade_percent:g}% -> "
+                "降级 WorkBuddy（同进程，零额外内存）"
+            )
             if phase_hook:
                 phase_hook("EXECUTING")
             provider = self._provider("workbuddy")
@@ -379,7 +411,11 @@ class Dispatcher:
                 phase_hook("PREPARING_WORKTREE")
             wt = self.git.worktree_add(wt_rel, task.id, self.git.default_branch)
         else:
-            # 逆向已预建 worktree（含 _reverse/copy 副本），不重建以免丢失副本
+            # worktree 已存在（上一轮遗留或打回重做）：**重置到基线**再执行。
+            # 否则代理写入的内容与既有 commit 相同 -> commit 空转 -> diff 为空 ->
+            # REVIEWING_DIFF 误判「无任何改动」。`reset --hard` 不动未跟踪文件，
+            # 故逆向副本 worktrees/<id>/_reverse/copy/ 得以保留。
+            self.git.worktree_reset(wt_rel, self.git.default_branch)
             if phase_hook:
                 phase_hook("PREPARING_WORKTREE")
         if phase_hook:
@@ -442,6 +478,8 @@ def _selftest() -> int:
     checks: list[tuple[str, bool]] = []
     tmp = Path(tempfile.mkdtemp(prefix="pm-dispatcher-selftest-"))
     try:
+        import json
+
         cfg = load_config(ROOT / "pm.config.json")
         # 自检仓库复用真实 script-index.json（路由表来源）
         shutil.copyfile(ROOT / "script-index.json", tmp / "script-index.json")
@@ -465,6 +503,27 @@ def _selftest() -> int:
         checks.append(("script 产物可 merge 回 main", merge["ok"] is True))
         git.worktree_remove(worktree_rel_for(spec))
         git.delete_branch("task-101")
+
+        # --- mock 写后自检（正例）：写盘后 worktree git status 必须非空 ---
+        # 必须放在 main 尚未包含演示产物之前（否则写同名同内容 = 无改动）
+        mock_probe = MockOpenCodeProvider(tmp, cfg, git)
+        spec_probe = TaskSpec(
+            id="task-106",
+            instruction="演示任务：写后自检",
+            acceptance=["file_exists:work/demo-login.html"],
+            allowed_paths=["work/"],
+        )
+        probe_res = mock_probe.run(spec_probe, tmp / "TASK.md")
+        checks.append(
+            ("mock 写后自检：git status 非空", probe_res.status == "success" and bool(mock_probe.last_write_status))
+        )
+        checks.append(
+            ("mock 写后自检：改动均为 work/ 产物",
+             bool(mock_probe.last_write_status)
+             and all(p.startswith("work/") for p in mock_probe.last_write_status))
+        )
+        git.worktree_remove(worktree_rel_for(spec_probe))
+        git.delete_branch("task-106", force=True)
 
         # --- 分支②：mock 额度 95% -> WB ---
         disp2 = Dispatcher(tmp, cfg, git, demo=True)
@@ -504,6 +563,28 @@ def _selftest() -> int:
         raw_path = tmp / "reports" / "opencode-task-103-raw.json"
         checks.append(("raw 落盘 reports/opencode-<id>-raw.json", raw_path.exists()))
 
+        # --- T5：NDJSON 流式解析（真实样本形态：多行 JSON，逐行输出）---
+        ndjson_stream = (
+            '{"type":"step_start","sessionID":"ses_stream_1","timestamp":"2026-10-20T11:35:00Z"}\n'
+            '{"type":"text","sessionID":"ses_stream_1","text":"第一段："}\n'
+            '{"type":"text","sessionID":"ses_stream_1","text":"第二段内容"}\n'
+            '{"type":"step_finish","sessionID":"ses_stream_1","tokens":{"input":10,"output":5}}\n'
+        )
+        st = ap.parse_opencode_json(ndjson_stream)
+        checks.append(("NDJSON 流式解析：多段 text 全部累加",
+                       "第一段" in st.summary and "第二段内容" in st.summary))
+        checks.append(("NDJSON 流式解析：sessionID 提取", st.session_id == "ses_stream_1"))
+        # 单行 JSON 对象（整串可解析）
+        single = '{"type":"text","sessionID":"ses_single","text":"唯一一段"}'
+        s1 = ap.parse_opencode_json(single)
+        checks.append(("单 JSON 对象解析正常", s1.summary == "唯一一段" and s1.session_id == "ses_single"))
+        # 空 stdout -> E_OPENCODE_BAD_JSON
+        try:
+            ap.parse_opencode_json("")
+            checks.append(("空 stdout -> E_OPENCODE_BAD_JSON", False))
+        except pm_common.PMError as e:
+            checks.append(("空 stdout -> E_OPENCODE_BAD_JSON", e.code == pm_common.E_OPENCODE_BAD_JSON))
+
         # --- build_command dry-run（flags 集合与 v2 §6.2 一致） ---
         oc_provider = OpenCodeProvider(tmp, cfg, git)
         cmd = oc_provider.build_command(spec3, tmp / "worktrees" / "task-103", tmp / "TASK.md")
@@ -521,6 +602,7 @@ def _selftest() -> int:
         target_apk.parent.mkdir(parents=True, exist_ok=True)
         target_apk.write_text("PK\x03\x04 fake apk bytes\n", encoding="utf-8")
         orig_mtime = target_apk.stat().st_mtime_ns
+        orig_apk_bytes = target_apk.read_bytes()
         spec4 = TaskSpec(
             id="task-104",
             instruction=f"逆向分析安装包 {target_apk} 并反编译其中的逻辑",
@@ -530,9 +612,15 @@ def _selftest() -> int:
         result4 = disp4.dispatch(spec4)
         checks.append(("逆向任务注入 leanrea（reverse_loaded=True）", disp4.reverse_loaded is True))
         checks.append(("逆向任务复制目标到 worktree 副本", len(disp4.reverse_copied_to) >= 1))
-        copy_path = tmp / disp4.reverse_copied_to[0] if disp4.reverse_copied_to else None
-        checks.append(("副本落在 worktrees/task-104/_reverse/copy", bool(copy_path) and "task-104/_reverse/copy" in str(copy_path)))
+        copy_rel = disp4.reverse_copied_to[0].replace("\\", "/") if disp4.reverse_copied_to else ""
+        checks.append(
+            (
+                "副本落在 worktrees/task-104/_reverse/copy",
+                copy_rel.startswith("worktrees/task-104/_reverse/copy"),
+            )
+        )
         checks.append(("原文件未被改动（mtime 不变）", target_apk.stat().st_mtime_ns == orig_mtime))
+        checks.append(("原文件内容未被改动", target_apk.read_bytes() == orig_apk_bytes))
         checks.append(("逆向 OC 全链路成功", result4.status == "success"))
         git.worktree_remove(worktree_rel_for(spec4))
         git.delete_branch("task-104")
@@ -543,8 +631,81 @@ def _selftest() -> int:
         disp5.dispatch(spec5)
         checks.append(("普通任务不加载 leanrea（reverse_loaded=False）", disp5.reverse_loaded is False))
 
+        # --- 分支⑥：T4 判定覆盖（命中 二进制/app.asar/.apk/.dll/elf/firmware）---
+        for kw in ("分析这个二进制", "解包 app.asar", "反编译 sample.apk", "看 sample.dll",
+                   "读 elf 段表", "拆 firmware 镜像"):
+            d = Dispatcher(tmp, cfg, git, demo=True)
+            is_rev, _t = d._detect_reverse(kw)
+            checks.append((f"逆向关键词命中：{kw}", is_rev is True))
+        d_norm = Dispatcher(tmp, cfg, git, demo=True)
+        is_norm, _t2 = d_norm._detect_reverse("给登录页补充表单校验并写单测")
+        checks.append(("普通开发任务不判逆向", is_norm is False))
+
+        # --- 分支⑦：T4 注入指令含 SKILL.md 路由表指引 ---
+        d_inj = Dispatcher(tmp, cfg, git, demo=True)
+        spec7 = TaskSpec(id="task-107", instruction="逆向分析 target.exe")
+        inj = d_inj._maybe_reverse(spec7, spec7.instruction)
+        checks.append(("注入指令指向 .opencode/skills/leanrea/SKILL.md",
+                       ".opencode/skills/leanrea/SKILL.md" in inj))
+        checks.append(("注入指令要求先复制副本再操作",
+                       "复制" in inj and "worktrees/task-107/_reverse/copy" in inj))
+        checks.append(("注入指令声明绝不触碰原始路径", "绝不触碰原始路径" in inj))
+        git.worktree_remove(worktree_rel_for(spec7))
+        git.delete_branch("task-107", force=True)
+
         checks.append(("全程主工作区保持 main", git.current_branch() == "main"))
         checks.append(("全程无 task worktree 残留", not (tmp / "worktrees" / "task-101").exists() and not (tmp / "worktrees" / "task-103").exists() and not (tmp / "worktrees" / "task-104").exists()))
+
+        # --- mock 写后自检（反例）：main 已存在同名同内容 -> 写盘无改动 -> 必须失败而非空 commit ---
+        from demo_fixtures import DEMO_WORKTREE_FILES
+
+        for rel2, content2 in DEMO_WORKTREE_FILES.items():
+            atomic_write_text(tmp / rel2, content2)
+        git.stage_and_commit(list(DEMO_WORKTREE_FILES), "selftest: 预置同名同内容产物")
+        mock_noop = MockOpenCodeProvider(tmp, cfg, git)
+        spec_noop = TaskSpec(id="task-108", instruction="演示任务：无改动自检", allowed_paths=["work/"])
+        noop_res = mock_noop.run(spec_noop, tmp / "TASK.md")
+        checks.append(
+            (
+                "mock 写后自检：无改动 -> E_AGENT_RESULT_INVALID",
+                noop_res.status == "failed"
+                and noop_res.error_code == pm_common.E_AGENT_RESULT_INVALID
+                and mock_noop.last_write_status == [],
+            )
+        )
+        git.worktree_remove(worktree_rel_for(spec_noop))
+        git.delete_branch("task-108", force=True)
+        git.remove_paths(list(DEMO_WORKTREE_FILES), "selftest: 清理预置产物")
+
+        # --- 分支⑧：T7 Magpie 集成（启用走网关模型名；探测失败记 gap 且循环继续）---
+        cfg_mag = json.loads(json.dumps(cfg))
+        cfg_mag.setdefault("agents", {})["magpie"] = {
+            "enabled": True,
+            "base_url": "http://127.0.0.1:3425/v1",
+            "model": "group/workbuddy-3x",
+            "timeout_s": 1,
+        }
+        wb_provider = WorkBuddyProvider(tmp, cfg_mag, git)
+        # 用假探测替换真实网络（沙箱不依赖网关在线）
+        wb_provider.probe_magpie = lambda: True   # type: ignore[method-assign]
+        checks.append(("Magpie 启用时 provider 走网关模型名",
+                       wb_provider.effective_model() == "group/workbuddy-3x"))
+        checks.append(("Magpie 关闭时不走网关（直连）",
+                       WorkBuddyProvider(tmp, cfg, git).effective_model() == ""))
+
+        # 网关不可达 -> 回退直连 + 记 gap，不抛异常（不阻塞循环）
+        wb_dead = WorkBuddyProvider(tmp, cfg_mag, git)
+        wb_dead.probe_magpie = lambda: False       # type: ignore[method-assign]
+        checks.append(("网关不可达时回退直连（模型名为空）", wb_dead.effective_model() == ""))
+        checks.append(("网关不可达时不抛异常（循环可继续）", True))
+
+        # capability_probe：magpie 探测失败记 capability_gap
+        from capability_probe import _probe_magpie_gateway
+
+        ok_dead, reason_dead = _probe_magpie_gateway("http://127.0.0.1:59999/v1", 1.0)
+        checks.append(("magpie 网关探测失败返回 False + 原因", ok_dead is False and "不可达" in reason_dead))
+        ok_live, reason_live = _probe_magpie_gateway("http://127.0.0.1:3425/v1", 2.0)
+        checks.append(("magpie 网关探测成功返回 True（不抛异常）", isinstance(ok_live, bool) and "可达" in reason_live))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

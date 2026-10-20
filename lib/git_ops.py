@@ -47,6 +47,7 @@ worktrees/
 __pycache__/
 .demo-remote/
 .DS_Store
+activity.jsonl
 """
 
 
@@ -143,6 +144,14 @@ class GitOps:
         if not self._git(["config", "user.email"]).stdout.strip():
             self._git(["config", "user.name", self.author_name])
             self._git(["config", "user.email", self.author_email])
+
+        # 行尾策略（Windows 关键）：本项目 diff / blob 逐字节比对（demo 基线复位、
+        # 写后自检）都假定 **LF 原样落盘**。系统级 core.autocrlf=true 会让
+        # worktree checkout 成 CRLF，Python 再写回 LF 后 `git status` 出现
+        # 「内容相同却 modified」的假脏（size 200 vs 196），把验收判成「有改动」。
+        # 仓库级关掉，保证 git 行为与字节比对一致。
+        self._git(["config", "core.autocrlf", "false"])
+        self._git(["config", "core.safecrlf", "false"])
 
         self._ensure_scaffold()
 
@@ -325,18 +334,64 @@ class GitOps:
     # ------------------------------------------------------------------
 
     def worktree_add(self, rel_path: str, branch: str, base: str = "main") -> Path:
-        """git worktree add <root>/<rel_path> -b <branch> <base>；返回绝对路径。"""
+        """git worktree add <root>/<rel_path> -B <branch> <base>；返回绝对路径。
+
+        用 `-B`（而非 `-b`）：分支已存在时**重置到 base**而不是报 fatal。这样
+        「同一 task 反复重派 / 崩溃恢复后重建」都不会因残留分支而失败。
+        """
         wt = self.root / rel_path
         if wt.exists():
             # 已存在同名 worktree：先回收再建（中断续派场景）
             self.worktree_remove(rel_path, force=True)
-        proc = self._git(["worktree", "add", str(wt), "-b", branch, base])
+        proc = self._git(["worktree", "add", str(wt), "-B", branch, base])
         if proc.returncode != 0:
             raise PMError(
                 E_GIT_WORKTREE_FAILED,
                 f"worktree add 失败({rel_path}, {branch}): {(proc.stderr or '').strip()[:500]}",
             )
         return wt
+
+    def worktree_reset(self, rel_path: str, base: str = "main") -> bool:
+        """worktree 内 `git reset --hard <base>`：重置已跟踪文件到基线。
+
+        **不动未跟踪文件**（逆向副本 _reverse/ 等工作副本得以保留）。
+        用于「打回重做」：重做必须从干净基线出发，不能继承上一次的错误改动。
+        """
+        wt = self.root / rel_path
+        if not wt.exists():
+            return False
+        proc = self._git(["reset", "--hard", base], cwd=wt)
+        return proc.returncode == 0
+
+    def remove_paths(self, paths: list[str], message: str) -> str:
+        """git rm -f -- <paths> 后提交（删除仓库内已跟踪文件）；返回 commit sha。
+
+        用于 demo 基线复位（清理上一轮遗留的同名演示产物，保证 diff 可观测）。
+        """
+        tracked: list[str] = []
+        for p in paths:
+            if self._git(["ls-files", "--error-unmatch", "--", p]).returncode == 0:
+                tracked.append(p)
+        if not tracked:
+            return ""
+        proc = self._git(["rm", "-f", "--"] + tracked)
+        if proc.returncode != 0:
+            raise PMError(
+                E_GIT_COMMIT_FAILED,
+                f"git rm 失败: {(proc.stderr or '').strip()[:500]}",
+            )
+        commit = self._git(["commit", "-m", message], env=self._identity_env())
+        if commit.returncode != 0:
+            raise PMError(
+                E_GIT_COMMIT_FAILED,
+                f"commit 失败: {(commit.stderr or '').strip()[:500]}",
+            )
+        return self.head_sha(short=True)
+
+    def tracked_blob(self, path: str) -> str:
+        """读仓库内某已跟踪路径的 blob 内容（空串表示不存在/读不出）。"""
+        proc = self._git(["show", f"HEAD:{path}"])
+        return proc.stdout if proc.returncode == 0 else ""
 
     def worktree_remove(self, rel_path: str, force: bool = True) -> None:
         """git worktree remove --force；不存在则静默（并 prune）。"""
@@ -390,19 +445,26 @@ class GitOps:
         proc = self._git(["diff", "--name-only", f"{base}...{branch}"])
         return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
 
-    def status_paths(self, cwd_rel: str = ".") -> list[str]:
-        """git status --porcelain（WB 同进程路径用：审查 main 未提交改动）。"""
+    def status_paths(self, cwd_rel: str = ".", paths: list[str] | None = None) -> list[str]:
+        """git status --porcelain（WB 同进程路径用：审查 main 未提交改动）。
+
+        paths 非空时只查这些路径（`-- <paths>`），用于「写后自检」精确断言
+        某个产物确实产生改动，不被其它未跟踪文件干扰。
+        """
         cwd = self.root / cwd_rel
-        proc = self._git(["status", "--porcelain"], cwd=cwd)
-        paths: list[str] = []
+        args = ["status", "--porcelain"]
+        if paths:
+            args += ["--"] + list(paths)
+        proc = self._git(args, cwd=cwd)
+        paths_out: list[str] = []
         for line in proc.stdout.splitlines():
             if len(line) < 4:
                 continue
             p = line[3:].strip()
             if "->" in p:  # 重命名：取新路径
                 p = p.split("->", 1)[1].strip()
-            paths.append(p.strip('"'))
-        return paths
+            paths_out.append(p.strip('"'))
+        return paths_out
 
     # ------------------------------------------------------------------
     # 远端 / 杂项

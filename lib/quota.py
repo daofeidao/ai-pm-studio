@@ -107,7 +107,12 @@ def percent_from_usage_data(data: Any) -> tuple[float, dict[str, float]] | None:
 class QuotaService:
     """额度服务：stats CLI 优先 -> usage HTTP 兜底 -> stale 放行；60s 缓存。"""
 
-    def __init__(self, cfg: dict[str, Any], demo: bool = False) -> None:
+    def __init__(
+        self,
+        cfg: dict[str, Any],
+        demo: bool = False,
+        demo_percent: float | None = None,
+    ) -> None:
         self.cfg = cfg
         self.demo = demo or bool(cfg.get("demo", {}).get("enabled", False))
         self._cache: QuotaInfo | None = None
@@ -116,13 +121,30 @@ class QuotaService:
         self.cache_s: float = float(q.get("cache_s", 60))
         self.usage_url: str = q.get("usage_url", "https://opencode.ai/zen/go/v1/usage")
         self.degrade_percent: float = float(q.get("degrade_percent", 90))
+        #: demo 假额度百分比（config 可覆盖；CLI --demo-quota-percent 可再覆盖）
+        self.demo_percent: float = float(
+            q.get("demo_quota_percent", 22) if demo_percent is None else demo_percent
+        )
 
     # ------------------------------------------------------------------
 
     def fetch(self, force: bool = False) -> QuotaInfo:
-        """取额度；demo 直接返回假额度；60s 内不重复请求（计时可证）。"""
+        """取额度；demo 直接返回假额度；60s 内不重复请求（计时可证）。
+
+        demo 假额度按 `demo_percent`（默认配置 22）生成：
+        超过 `degrade_percent`（默认 90）时返回 DEMO_QUOTA_EXCEEDED 形态，
+        用于离线演练「额度超限 → 降级 WorkBuddy」。
+        """
         if self.demo:
-            return self._from_dict(DEMO_QUOTA)
+            if self.demo_percent > self.degrade_percent:
+                d = dict(DEMO_QUOTA_EXCEEDED)
+                d["max_percent"] = self.demo_percent
+                d["windows"] = {"5h": self.demo_percent, "week": self.demo_percent,
+                                "month": self.demo_percent}
+                return self._from_dict(d)
+            d = dict(DEMO_QUOTA)
+            d["max_percent"] = self.demo_percent
+            return self._from_dict(d)
         now = time.monotonic()
         if not force and self._cache is not None and (now - self._cache_at) < self.cache_s:
             return self._cache
@@ -223,6 +245,11 @@ def _selftest() -> int:
     info = svc.fetch()
     checks.append(("demo 额度 max_percent=22", info.max_percent == 22))
     checks.append(("demo 额度非 stale", info.stale is False))
+    # 1b) demo 额度可覆盖（>= 降级线）——离线演练「降级 WorkBuddy」
+    hi = QuotaService(cfg, demo=True, demo_percent=95).fetch()
+    checks.append(
+        ("demo 额度可覆盖为 95（超降级线 90）", hi.max_percent == 95 and hi.max_percent > 90)
+    )
 
     # 2) 缓存计时：连续两次 fetch，第二次不重新探测（对象同一）
     svc2 = QuotaService(cfg, demo=True)

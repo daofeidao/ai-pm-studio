@@ -50,6 +50,7 @@
   "loop": {
     "max_rounds": 10,
     "max_rework": 2,
+    "circuit_breaker_threshold": 3,
     "reject_action": "handover"
   },
   "web_ai": {
@@ -57,10 +58,26 @@
     "chat_url": "https://chat.deepseek.com",
     "cdp_py": "C:/Users/Administrator/.workbuddy/skills/browser-automation-cdp/scripts/cdp.py",
     "timeout_s": 120,
-    "poll_s": 3
+    "poll_s": 3,
+    "selectors": {
+      "input": "textarea#chat-input",
+      "send_button": "button[aria-label*='发送']",
+      "answer_container": "div.ds-markdown"
+    }
   },
   "dashboard": {
     "refresh_s": 2
+  },
+  "agents": {
+    "magpie": {
+      "_comment": "Magpie 网关（多账号 WorkBuddy 路由）。网关不可达时自动回退直连并记 capability_gap，不阻塞循环。",
+      "enabled": true,
+      "base_url": "http://127.0.0.1:3425/v1",
+      "model": "group/workbuddy-3x",
+      "timeout_s": 3,
+      "health_check": "tools/magpie/check-magpie-health.ps1",
+      "setup_script": "tools/magpie/setup-magpie-workbuddy.ps1"
+    }
   },
   "approval": {
     "queue": "commands/queue.jsonl"

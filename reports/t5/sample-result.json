@@ -1,0 +1,23 @@
+{
+  "ok": false,
+  "reason": "超时（已 kill 进程树）",
+  "argv": [
+    "C:/Users/Administrator/AppData/Local/Programs/@opencodedesktop/resources/opencode-cli.exe",
+    "run",
+    "--format",
+    "json",
+    "echo smoke",
+    "--standalone",
+    "--auto"
+  ],
+  "started_at": "2026-10-20T08:20:57Z",
+  "finished_at": "2026-10-20T08:23:57Z",
+  "returncode": 1,
+  "timed_out": true,
+  "stdout_bytes": 0,
+  "stderr_bytes": 0,
+  "stdout_path": "reports/t5/opencode-sample-stdout.txt",
+  "stderr_path": "reports/t5/opencode-sample-stderr.txt",
+  "stdout_preview": "",
+  "stderr_preview": ""
+}

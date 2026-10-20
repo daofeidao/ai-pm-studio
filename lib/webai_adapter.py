@@ -25,6 +25,7 @@ from pm_common import (
     E_CDP_UNREACHABLE,
     E_CAPABILITY_GAP,
     E_WEB_AI_NOT_LOGGED_IN,
+    E_WEB_AI_SELECTOR,
     E_WEB_AI_TIMEOUT,
     PMError,
     atomic_write_text,
@@ -32,6 +33,63 @@ from pm_common import (
     utc_now_iso,
 )
 from demo_fixtures import DEMO_WEB_REPLY, demo_reply_for_round
+
+# ---------------------------------------------------------------------------
+# 主路径选择器常量区（v2.1：页面改版只改这里；Q3 实测后固化）
+# ---------------------------------------------------------------------------
+
+#: DeepSeek 主路径选择器（CDP 五步用）
+DEEPSEEK_SELECTORS: dict[str, str] = {
+    "input": "textarea#chat-input",
+    "send_button": "button[aria-label*='发送']",
+    "answer_container": "div.ds-markdown",
+}
+
+#: 兜底后端模块名（缺失选择器时尝试 import；提供 aiAct 动作）
+DRISSIONPAGE_AI_MODULE = "drissionpage_ai"
+
+#: 兜底后端提供的动作名（drissionpage-ai 的 AI 辅助点击/输入）
+DRISSIONPAGE_AI_ACTION = "aiAct"
+
+
+def drissionpage_ai_available() -> bool:
+    """兜底后端 drissionpage-ai 是否可 import（仅探测，不加载重依赖）。
+
+    不可用时调用方应 raise E_WEB_AI_SELECTOR（转人审），不静默降级。
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(DRISSIONPAGE_AI_MODULE) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def resolve_web_ai_selector(
+    selectors: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """解析主路径选择器；缺失时走兜底，否则 raise E_WEB_AI_SELECTOR。
+
+    返回 (模式, 选择器)：模式为 "primary"（走 CDP 主路径）或 "aiAct"（兜底）。
+
+    规则（v2.1 T2）：
+      1. 主路径三个选择器齐备 -> ("primary", input 选择器)；
+      2. 选择器缺失且 drissionpage-ai 可 import -> ("aiAct", "")；
+      3. 否则 raise PMError(E_WEB_AI_SELECTOR) —— 由编排器转 AWAITING_APPROVAL。
+    """
+    sel = dict(DEEPSEEK_SELECTORS if selectors is None else selectors)
+    required = ("input", "send_button", "answer_container")
+    missing = [k for k in required if not str(sel.get(k, "")).strip()]
+    if not missing:
+        return ("primary", str(sel["input"]).strip())
+    if drissionpage_ai_available():
+        return ("aiAct", "")
+    raise PMError(
+        E_WEB_AI_SELECTOR,
+        "网页 AI 主路径选择器缺失（"
+        + ",".join(missing)
+        + f"）且兜底 {DRISSIONPAGE_AI_MODULE} 不可用；需人工提供选择器或安装兜底后端",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +146,9 @@ class DeepSeekAdapter(WebAIAdapter):
 
     # ---- 常量区（选择器变更只改这里；Q3 实测后固化） ----
     CHAT_URL = "https://chat.deepseek.com"
-    INPUT_SELECTOR = "textarea#chat-input"                 # 占位：输入框（待实测固化）
-    SEND_BUTTON_SELECTOR = "button[aria-label*='发送']"     # 占位：发送钮（待实测固化）
-    ANSWER_CONTAINER_SELECTOR = "div.ds-markdown"           # 占位：回答容器（待实测固化）
+    INPUT_SELECTOR = DEEPSEEK_SELECTORS["input"]                # 输入框
+    SEND_BUTTON_SELECTOR = DEEPSEEK_SELECTORS["send_button"]    # 发送钮
+    ANSWER_CONTAINER_SELECTOR = DEEPSEEK_SELECTORS["answer_container"]  # 回答容器
     LOGIN_PAGE_MARKERS = ("登录", "login", "sign in", "扫码")
     TIMEOUT_S = 120
     POLL_S = 3
@@ -111,6 +169,13 @@ class DeepSeekAdapter(WebAIAdapter):
         self.chat_url: str = wa.get("chat_url", self.CHAT_URL)
         self.timeout_s: int = int(wa.get("timeout_s", self.TIMEOUT_S))
         self.poll_s: float = float(wa.get("poll_s", self.POLL_S))
+        # 主路径选择器：常量区默认值 + 配置覆盖（配置可置空以演练兜底/缺失）
+        configured = wa.get("selectors")
+        self.selectors: dict[str, str] = dict(DEEPSEEK_SELECTORS)
+        if isinstance(configured, dict):
+            for k in ("input", "send_button", "answer_container"):
+                if k in configured:
+                    self.selectors[k] = str(configured[k] or "").strip()
 
     # ---- CDP 调用封装 ----
 
@@ -146,6 +211,10 @@ class DeepSeekAdapter(WebAIAdapter):
 
     def send_prompt(self, prompt: str, memory_pack: str | None = None) -> WebAIReply:
         full_prompt = prompt if not memory_pack else f"{memory_pack}\n\n{prompt}"
+        # ⓪ 选择器解析（v2.1 T2）：主路径缺失 -> 兜底 aiAct -> 否则 E_WEB_AI_SELECTOR
+        mode, _selector = resolve_web_ai_selector(self.selectors)
+        if mode == "aiAct":
+            return self._send_prompt_ai_act(full_prompt)
         # ① 探测
         self._cdp(["status"], timeout_s=30)
         # ② 导航
@@ -188,19 +257,71 @@ class DeepSeekAdapter(WebAIAdapter):
         threshold = int(self.cfg.get("memory", {}).get("threshold_chars", 24000))
         return ContextUsage(chars_used=int(threshold * 0.7), chars_limit=threshold)
 
+    def _send_prompt_ai_act(self, full_prompt: str) -> WebAIReply:
+        """兜底路径：用 drissionpage-ai 的 aiAct 动作完成输入+提交+取答。
+
+        仅在主路径选择器缺失、但 drissionpage-ai 可 import 时才可能走到
+        （resolve_web_ai_selector 已把关）。后端不可用时抛 E_WEB_AI_SELECTOR。
+        """
+        import importlib
+
+        try:
+            mod = importlib.import_module(DRISSIONPAGE_AI_MODULE)
+        except ImportError as e:
+            raise PMError(
+                E_WEB_AI_SELECTOR,
+                f"兜底后端 {DRISSIONPAGE_AI_MODULE} 导入失败：{e}",
+            ) from e
+        action = getattr(mod, DRISSIONPAGE_AI_ACTION, None)
+        if action is None:
+            raise PMError(
+                E_WEB_AI_SELECTOR,
+                f"兜底后端 {DRISSIONPAGE_AI_MODULE} 未提供 {DRISSIONPAGE_AI_ACTION} 动作",
+            )
+        try:
+            answer = action(full_prompt)
+        except Exception as e:  # noqa: BLE001 —— 兜底失败按选择器缺失转人审
+            raise PMError(
+                E_WEB_AI_SELECTOR,
+                f"兜底 {DRISSIONPAGE_AI_MODULE}.{DRISSIONPAGE_AI_ACTION} 执行失败：{e}",
+            ) from e
+        answer = str(answer or "").strip()
+        if not answer:
+            raise PMError(E_WEB_AI_SELECTOR, "兜底 aiAct 未取到回答")
+        raw_path = self.root / "reports" / f"webai-aiact-{pm_common.compact_ts()}.md"
+        atomic_write_text(raw_path, f"# Q\n{full_prompt}\n\n# A\n{answer}\n")
+        return WebAIReply(
+            text=answer,
+            context_usage=self.get_context_usage(),
+            raw_path=str(raw_path.relative_to(self.root)),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Mock 适配器（demo：零浏览器进程）
 # ---------------------------------------------------------------------------
 
 class MockWebAIAdapter(WebAIAdapter):
-    """demo 用假网页 AI：返回 demo_fixtures 固定回答，不启 CDP/浏览器。"""
+    """demo 用假网页 AI：返回 demo_fixtures 固定回答，不启 CDP/浏览器。
 
-    def __init__(self, cfg: dict[str, Any], round_no: int = 1) -> None:
+    `selector_missing=True` 时模拟「主路径选择器缺失且兜底不可用」：
+    send_prompt 直接 raise E_WEB_AI_SELECTOR（编排器据此转 AWAITING_APPROVAL）。
+    """
+
+    def __init__(
+        self,
+        cfg: dict[str, Any],
+        round_no: int = 1,
+        selector_missing: bool = False,
+    ) -> None:
         self.cfg = cfg
         self.round_no = round_no
+        self.selector_missing = selector_missing
 
     def send_prompt(self, prompt: str, memory_pack: str | None = None) -> WebAIReply:
+        if self.selector_missing:
+            # 走真实的选择器解析逻辑：缺选择器 + 无兜底 -> E_WEB_AI_SELECTOR
+            resolve_web_ai_selector({"input": "", "send_button": "", "answer_container": ""})
         text = demo_reply_for_round(self.round_no)
         return WebAIReply(text=text, context_usage=self.get_context_usage(), raw_path=None)
 
@@ -236,10 +357,14 @@ def build_adapter(
     demo: bool = False,
     round_no: int = 1,
     provider: str | None = None,
+    selector_missing: bool = False,
 ) -> WebAIAdapter:
-    """按配置/demo 标志构造适配器（P3 新增 provider 不改编排代码）。"""
+    """按配置/demo 标志构造适配器（P3 新增 provider 不改编排代码）。
+
+    `selector_missing=True` 仅用于 demo 演练 T2：主路径选择器缺失场景。
+    """
     if demo:
-        return MockWebAIAdapter(cfg, round_no=round_no)
+        return MockWebAIAdapter(cfg, round_no=round_no, selector_missing=selector_missing)
     name = (provider or cfg.get("web_ai", {}).get("provider", "deepseek")).lower()
     if name == "deepseek":
         return DeepSeekAdapter(root, cfg)

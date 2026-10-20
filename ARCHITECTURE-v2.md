@@ -861,7 +861,7 @@ def parse_opencode_json(raw_stdout: str) -> AgentResult:
 - **优先级**：P0
 - **逐文件要点**：
   1. `lib/webai_adapter.py`：`WebAIAdapter` ABC（`send_prompt`/`get_context_usage`）；`DeepSeekAdapter`（常量区：`CHAT_URL="https://chat.deepseek.com"`、输入框/发送钮/回答容器选择器占位串、`TIMEOUT_S=120`、`POLL_S=3`）；`MockWebAIAdapter`（demo：返回 `demo_fixtures.DEMO_WEB_REPLY`，`get_context_usage` 返回配置阈值附近的假用量）；`ChatGPTPlaceholderAdapter`（P3，`send_prompt` 抛 `E_CAPABILITY_GAP` 占位）。
-  2. `web_ai.py`：CDP 五步——①`cdp.py status` 探测（不可达→`E_CDP_UNREACHABLE=32` 并提示启动调试 Edge）②导航到 CHAT_URL（落登录页→`E_WEB_AI_NOT_LOGGED_IN=31`）③`type` 输入 + 提交 ④`wait` 轮询回答容器（timeout→`E_WEB_AI_TIMEOUT=30`）⑤`text` 抽取；`--demo` 时内部切 `MockWebAIAdapter` 不启 CDP；`main()` 子命令 `ask "问题"` / `--selftest`。
+  2. `web_ai.py`：CDP 五步——①`cdp.py status` 探测（不可达→`E_CDP_UNREACHABLE=32` 并提示启动调试 Edge）②导航到 CHAT_URL（落登录页→`E_WEB_AI_NOT_LOGGED_IN=31`）③`type` 输入 + 提交 ④`wait` 轮询回答容器（timeout→`E_WEB_AI_TIMEOUT=30`）⑤`text` 抽取；`--demo` 时内部切 `MockWebAIAdapter` 不启 CDP；`main()` 子命令 `ask "问题"` / `--selftest`。**主路径选择器集中在常量区**（`webai_adapter.DEEPSEEK_SELECTORS` / `pm.config.json` 的 `web_ai.selectors`）；选择器缺失时若 `drissionpage-ai` 可 import → 走 `aiAct` 兜底，否则 raise `E_WEB_AI_SELECTOR=33`，编排器据此进入 AWAITING_APPROVAL 等人审（不崩溃）。
   3. `SKILL.md`：**写死禁止加载 `browser-agent` / `playwright-browser-agent`**；只允许调 `browser-automation-cdp` 的 `scripts/cdp.py`（绝对路径写死）；不下载 Chromium；选择器变更只改常量区。
 - **验收标准**：
   - [ ] `python web_ai.py ask "你好" --demo` 返回假回答且零 CDP/浏览器进程
@@ -1008,7 +1008,7 @@ python .workbuddy/skills/pm-orchestrator/orchestrator.py resume --demo
    <本轮问题全文>
    ```
 8. **错误码**（v1 保留 + v2 新增）：
-   `E_OK=0`；`E_LOCK_BUSY=10`；`E_QUOTA_EXCEEDED=20`；`E_WEB_AI_TIMEOUT=30`；`E_WEB_AI_NOT_LOGGED_IN=31`；`E_CDP_UNREACHABLE=32`；`E_AGENT_CRASH=40`；`E_AGENT_RESULT_INVALID=41`；`E_AGENT_TIMEOUT=42`；`E_OPENCODE_BAD_JSON=43`；`E_HUMAN_REJECTED=50`；`E_SCRIPT_NOT_FOUND=60`；`E_CAPABILITY_GAP=70`（记录不阻塞）；`E_STATE_CORRUPT=80`；`E_GIT_INIT_FAILED=90`；`E_GIT_COMMIT_FAILED=91`；`E_GIT_PUSH_FAILED=92`（best-effort 警告，不阻塞）；`E_GIT_WORKTREE_FAILED=93`；`E_MERGE_CONFLICT=94`；`E_DIFF_REJECTED=95`；`E_HANDOFF_IO=96`。进程退出码与错误码一致。
+   `E_OK=0`；`E_LOCK_BUSY=10`；`E_QUOTA_EXCEEDED=20`；`E_WEB_AI_TIMEOUT=30`；`E_WEB_AI_NOT_LOGGED_IN=31`；`E_CDP_UNREACHABLE=32`；`E_WEB_AI_SELECTOR=33`（网页 AI 主路径选择器缺失且兜底不可用 → 转 AWAITING_APPROVAL 人审，不崩溃）；`E_AGENT_CRASH=40`；`E_AGENT_RESULT_INVALID=41`；`E_AGENT_TIMEOUT=42`；`E_OPENCODE_BAD_JSON=43`；`E_HUMAN_REJECTED=50`；`E_SCRIPT_NOT_FOUND=60`；`E_CAPABILITY_GAP=70`（记录不阻塞）；`E_STATE_CORRUPT=80`；`E_GIT_INIT_FAILED=90`；`E_GIT_COMMIT_FAILED=91`；`E_GIT_PUSH_FAILED=92`（best-effort 警告，不阻塞）；`E_GIT_WORKTREE_FAILED=93`；`E_MERGE_CONFLICT=94`；`E_DIFF_REJECTED=95`；`E_HANDOFF_IO=96`。进程退出码与错误码一致。
 9. **时间**：一律 ISO 8601 UTC（`datetime.now(timezone.utc).isoformat(timespec="seconds")`，例 `2026-10-20T11:34:41+00:00`，序列化时统一 `Z` 尾）；看板展示层转本地。
 10. **路径**：一律相对 `pm.config.json` 的 `root`，Windows 统一正杠；Python 固定 managed 3.13.12 绝对路径；git 用系统 git。
 11. **OpenCode 边界**：只在 worktree 内工作；`--auto` 可带（隔离兜底）；不可逆操作只写进 `irreversible_ops`，由编排器在人工审批后执行；`--continue/--session` 仅本机。

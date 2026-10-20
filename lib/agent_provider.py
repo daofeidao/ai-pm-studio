@@ -128,26 +128,53 @@ def _extract_text(obj: dict) -> str:
 def parse_opencode_json(raw_stdout: str) -> AgentResult:
     """解析 `opencode run --format json` 输出。
 
-    1) 先试整串 json.loads；2) 失败按行 NDJSON 解析，取**最后一个能探测到 text** 的对象；
-    3) 字段多候选探测：text / sessionID / tokens；4) 取不到 text -> E_AGENT_RESULT_INVALID=41。
+    解析策略（v2.1 T5，按真实样本校正）：
+    1. 先试整串 `json.loads` —— 兼容「输出单个 JSON 对象」；
+    2. 失败则**按行/流式解析**（NDJSON）：逐行 `json.loads`，
+       **按出现顺序累加**所有含 text 的片段（流式输出的文本被拆成多行时，
+       只取最后一行会丢内容），并取最后一个出现的 sessionID；
+    3. 字段多候选探测：text / sessionID / tokens；
+    4. 取不到 text -> E_AGENT_RESULT_INVALID=41；整行都不可解析 -> E_OPENCODE_BAD_JSON=43。
+
+    真实样本观测见 `docs/opencode-json-sample.md`（含 stdout 为空的场景）。
     """
-    obj: Any = None
     text = (raw_stdout or "").strip()
-    if text:
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError:
+    if not text:
+        raise PMError(E_OPENCODE_BAD_JSON, "opencode json 输出为空（无 stdout）")
+
+    obj: Any = None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        # 按行/流式解析：累加所有 text 片段，保持顺序
+        pieces: list[str] = []
+        session: str | None = None
+        parsed_any = False
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            parsed_any = True
+            piece = _extract_text(candidate)
+            if piece:
+                pieces.append(piece)
+            for k in ("sessionID", "session_id", "sessionId"):
+                v = candidate.get(k)
+                if isinstance(v, str) and v:
+                    session = v
+        if parsed_any and pieces:
+            obj = {
+                "text": "".join(pieces),
+                **({"sessionID": session} if session else {}),
+            }
+        else:
             obj = None
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    candidate = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(candidate, dict) and _extract_text(candidate):
-                    obj = candidate  # 最后一个含 text 的对象
     if not isinstance(obj, dict):
         raise PMError(E_OPENCODE_BAD_JSON, "opencode json 输出不可解析（整串与按行均失败）")
 
@@ -207,17 +234,72 @@ def worktree_rel_for(task: TaskSpec) -> str:
 # ---------------------------------------------------------------------------
 
 class WorkBuddyProvider(AgentProvider):
-    """WB 即编排器宿主本身：run() 后由当前会话把改动直接写在 main 的 work/ 下。"""
+    """WB 即编排器宿主本身：run() 后由当前会话把改动直接写在 main 的 work/ 下。
+
+    T7 Magpie 集成：
+      - `agents.magpie.enabled=true` 时走网关 base_url + model（多账号 smart 路由）；
+      - 网关不可达 -> **回退直连**并记 capability_gap，**不阻塞循环**；
+      - `agents.magpie.enabled=false` -> 直连（默认 WorkBuddy 行为）。
+    """
 
     kind = "workbuddy"
+
+    def __init__(self, root: Path | str, cfg: dict[str, Any], git: Any) -> None:
+        super().__init__(root, cfg, git)
+        magpie = (cfg.get("agents") or {}).get("magpie") or {}
+        self.magpie_enabled: bool = bool(magpie.get("enabled", False))
+        self.magpie_base_url: str = str(magpie.get("base_url", "") or "")
+        self.magpie_model: str = str(magpie.get("model", "") or "")
+        self.magpie_timeout_s: float = float(magpie.get("timeout_s", 3) or 3)
+        #: 最近一次探测结论（供编排器/看板展示）
+        self.magpie_gateway_ok: bool | None = None
+        self.magpie_gap: str = ""
+
+    # ---- T7：网关探测 + 回退 ----
+
+    def probe_magpie(self) -> bool:
+        """探测 Magpie 网关（GET {base_url}/models，超时 3s）。
+
+        走 `pm_common.local_request`（显式空 ProxyHandler）：本机请求**绕过**
+        HTTP_PROXY/HTTPS_PROXY，避免代理把 127.0.0.1 也转发出去导致假「不可达」。
+
+        返回 True=可达。不可达时记 capability_gap（self.magpie_gap）并回退直连。
+        任何异常都吞掉转 gap，**绝不 raise 断主流程**。
+        """
+        if not self.magpie_enabled or not self.magpie_base_url:
+            self.magpie_gateway_ok = None
+            self.magpie_gap = ""
+            return False
+        url = self.magpie_base_url.rstrip("/") + "/models"
+        try:
+            pm_common.local_request(url, timeout_s=self.magpie_timeout_s)
+            self.magpie_gateway_ok = True
+            self.magpie_gap = ""
+            return True
+        except Exception as e:  # noqa: BLE001 —— 探测异常一律转 gap
+            self.magpie_gateway_ok = False
+            self.magpie_gap = f"网关不可达({url})：{e}"
+            return False
+
+    def effective_model(self) -> str:
+        """当前实际使用的模型名（走网关 -> group/...；否则直连 -> 空）。"""
+        if self.magpie_enabled and self.probe_magpie():
+            return self.magpie_model
+        return ""
 
     def run(self, task: TaskSpec, handoff_path: Path) -> AgentResult:
         # 同进程执行：不产子进程；改动由当前 WB 会话直写 main 的 work/，
         # REVIEWING_DIFF 走 git status 未提交改动审查 -> 提交（v2 R10）。
+        model = self.effective_model()
+        summary = "改动由当前 WorkBuddy 会话直写 main 的 work/（同进程，零额外内存）"
+        if model:
+            summary += f"；经 Magpie 网关路由（model={model}）"
+        elif self.magpie_enabled and self.magpie_gap:
+            summary += f"；Magpie 网关不可达，已回退直连（{self.magpie_gap}）"
         return AgentResult(
             status="executed_in_process",
             agent="workbuddy",
-            summary="改动由当前 WorkBuddy 会话直写 main 的 work/（同进程，零额外内存）",
+            summary=summary,
             artifacts=[],
             irreversible_ops=[],
             session_id=None,
@@ -235,7 +317,15 @@ class WorkBuddyProvider(AgentProvider):
         )
 
     def capabilities(self) -> dict[str, Any]:
-        return {"kind": "in_process", "memory": "~0"}
+        return {
+            "kind": "in_process",
+            "memory": "~0",
+            "magpie_enabled": self.magpie_enabled,
+            "magpie_base_url": self.magpie_base_url,
+            "magpie_model": self.magpie_model,
+            "magpie_gateway_ok": self.magpie_gateway_ok,
+            "magpie_gap": self.magpie_gap,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -282,9 +372,17 @@ class OpenCodeProvider(AgentProvider):
     # ---- 执行 ----
 
     def _ensure_worktree(self, task: TaskSpec) -> Path:
+        """确保 worktree 存在且处于**基线状态**。
+
+        worktree 已存在时先 `reset --hard base`：否则代理写入的内容与既有 commit
+        相同 -> `git commit` 空转（nothing to commit）-> task 分支无新 commit ->
+        `git diff main...task` 为空 -> REVIEWING_DIFF 误判「无任何改动」。
+        `reset --hard` 不动未跟踪文件，逆向副本 _reverse/copy/ 得以保留。
+        """
         rel = worktree_rel_for(task)
         wt = self.root / rel
         if wt.exists():
+            self.git.worktree_reset(rel, self.git.default_branch)
             return wt
         return self.git.worktree_add(rel, task.id, self.git.default_branch)
 
@@ -344,32 +442,85 @@ class OpenCodeProvider(AgentProvider):
 # ---------------------------------------------------------------------------
 
 class MockOpenCodeProvider(OpenCodeProvider):
-    """demo：真实 worktree + 真实 commit，结果取 demo_fixtures.DEMO_AGENT_RESULT。"""
+    """demo：真实 worktree + 真实 commit，结果取 demo_fixtures.DEMO_AGENT_RESULT。
+
+    `escape_write=True` 时额外在 **worktree 之外** 写一个文件，用于演练
+    `--auto` 事后安全检查（编排器应记 security_violation 并 PAUSE）。
+    `agent_fail=True` 时**不写任何产物**直接返回 E_AGENT_CRASH，用于演练
+    「连续失败 → 熔断」。
+
+    写后自检：写盘后先看 worktree `git status`，为空即判定 mock 本身失效
+    （产物没落盘 / 基线复位漏了），返回 E_AGENT_RESULT_INVALID，绝不静默 commit 空。
+    """
 
     kind = "opencode-mock"
 
-    def __init__(self, root, cfg, git, irreversible: bool = False) -> None:
+    def __init__(
+        self,
+        root,
+        cfg,
+        git,
+        irreversible: bool = False,
+        escape_write: bool = False,
+        agent_fail: bool = False,
+    ) -> None:
         super().__init__(root, cfg, git)
         self.irreversible = irreversible
+        self.escape_write = escape_write
+        self.agent_fail = agent_fail
+        #: 写后自检抓到的改动清单（供自检/QA 断言）
+        self.last_write_status: list[str] = []
 
     def run(self, task: TaskSpec, handoff_path: Path) -> AgentResult:
         from demo_fixtures import (
             DEMO_AGENT_RESULT,
             DEMO_AGENT_RESULT_IRREVERSIBLE,
+            DEMO_ESCAPE_WRITE_CONTENT,
+            DEMO_ESCAPE_WRITE_PATH,
             DEMO_WORKTREE_FILES,
         )
 
         started = time.time()
         wt = self._ensure_worktree(task)
+        if self.agent_fail:
+            # 演练熔断：模拟代理崩溃（无产物、无 commit）
+            return AgentResult(
+                status="failed",
+                agent="opencode",
+                error_code=E_AGENT_CRASH,
+                error_detail="demo：模拟代理崩溃（用于演练连续失败熔断）",
+                duration_ms=int((time.time() - started) * 1000),
+            )
         # 真实写文件 + 真实 commit 到 task 分支（Git 真）
         for rel, content in DEMO_WORKTREE_FILES.items():
             p = wt / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(p, content)
+
+        # —— 写后自检：git status 必须非空 ——
+        changed = self.git.status_paths(worktree_rel_for(task))
+        self.last_write_status = changed
+        if not changed:
+            return AgentResult(
+                status="failed",
+                agent="opencode",
+                error_code=E_AGENT_RESULT_INVALID,
+                error_detail=(
+                    "mock 写后自检失败：worktree git status 为空"
+                    f"（{', '.join(DEMO_WORKTREE_FILES)} 未产生改动；疑似基线未复位或写盘失效）"
+                ),
+                duration_ms=int((time.time() - started) * 1000),
+            )
+
         self.git._git(["add", "-A"], cwd=wt)
         self.git._git(
             ["commit", "-m", f"demo: {task.id} 登录页产物"], cwd=wt, env=self.git._identity_env()
         )
+        # T3 演练：模拟代理越界——在 worktree 之外写文件
+        if self.escape_write:
+            escape = self.root / DEMO_ESCAPE_WRITE_PATH
+            escape.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(escape, DEMO_ESCAPE_WRITE_CONTENT)
         data = DEMO_AGENT_RESULT_IRREVERSIBLE if self.irreversible else DEMO_AGENT_RESULT
         result = AgentResult(
             status=data["status"],
@@ -392,9 +543,15 @@ class MockWorkBuddyProvider(WorkBuddyProvider):
 
     产物文件名与 MockOpenCodeProvider 不同（wb-demo-login.html），避免同内容文件
     导致 task 分支 diff 为空（验收需要可见改动）。
+
+    写后自检：`git status -- <产物>` 必须非空，否则返回 E_AGENT_RESULT_INVALID。
     """
 
     kind = "workbuddy-mock"
+
+    def __init__(self, root, cfg, git) -> None:
+        super().__init__(root, cfg, git)
+        self.last_write_status: list[str] = []
 
     def run(self, task: TaskSpec, handoff_path: Path) -> AgentResult:
         from demo_fixtures import DEMO_WORKTREE_FILES
@@ -405,6 +562,18 @@ class MockWorkBuddyProvider(WorkBuddyProvider):
         p.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(p, html.replace("演示登录页", "演示登录页（WorkBuddy 同进程产物）"))
         written.append("work/wb-demo-login.html")
+
+        # —— 写后自检：该产物必须在 git status 中出现 ——
+        changed = self.git.status_paths(paths=written)
+        self.last_write_status = changed
+        if not changed:
+            return AgentResult(
+                status="failed",
+                agent="workbuddy",
+                error_code=E_AGENT_RESULT_INVALID,
+                error_detail="mock 写后自检失败：work/wb-demo-login.html 未出现在 git status",
+            )
+
         self.git.stage_and_commit(written, f"demo(wb): {task.id} 登录页产物")
         return AgentResult(
             status="success",

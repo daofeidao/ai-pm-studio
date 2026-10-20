@@ -36,6 +36,7 @@ from pm_common import (
     E_MERGE_CONFLICT,
     E_OK,
     E_STATE_CORRUPT,
+    E_WEB_AI_SELECTOR,
     PMError,
     atomic_write_json,
     atomic_write_text,
@@ -58,7 +59,8 @@ from webai_adapter import ContextUsage, build_adapter
 from quota import QuotaInfo, QuotaService
 from agent_provider import AgentResult, TaskSpec, worktree_rel_for
 from capability_probe import CapabilityProbe
-from demo_fixtures import DEMO_QUOTA
+from permissions import PermissionGuard, SecurityAuditor
+from activity import ActivityLog
 
 # memory.py 与 dispatcher.py 是 skill 脚本（位于 .workbuddy/skills/*/），动态加载
 sys.path.insert(0, str(ROOT / ".workbuddy" / "skills" / "pm-memory"))
@@ -207,6 +209,7 @@ class Orchestrator:
             demo_irreversible=getattr(self, "demo_irreversible", False),
         )
         self.quota_service = QuotaService(self.cfg, demo=self.demo)
+        self.activity = ActivityLog(self.root, "activity.jsonl")
         self.current: dict[str, Any] = self._default_state()
         self._last_result: AgentResult | None = None
         self._last_reply_text: str = ""
@@ -214,6 +217,16 @@ class Orchestrator:
         self._round_done: bool = False
         self._max_rounds: int = int(self.cfg.get("loop", {}).get("max_rounds", 10))
         self.max_rework: int = int(self.cfg.get("loop", {}).get("max_rework", 2))
+        #: 连续失败熔断阈值（同一 task 连续失败 N 次 -> PAUSED，不再烧额度）
+        self.circuit_threshold: int = int(
+            self.cfg.get("loop", {}).get("circuit_breaker_threshold", 3)
+        )
+        #: 上一次审批是否处于「无决策、落盘等待」状态（_run_task 据此停止）
+        self._awaiting_approval: bool = False
+        # T2：demo 演练「主路径选择器缺失」开关
+        self.demo_selector_missing: bool = False
+        # T3：demo 演练「代理越界写 worktree 之外」开关
+        self.demo_escape_write: bool = False
 
     # ------------------------------------------------------------------
     # 状态基础
@@ -233,6 +246,10 @@ class Orchestrator:
             "pending_approval": None,
             "last_commit": "",
             "last_push_ok": False,
+            #: 连续失败计数（成功即清零；到阈值 -> circuit_open）
+            "consecutive_failures": 0,
+            #: 熔断标志（True 时状态为 PAUSED，需人工 resume）
+            "circuit_open": False,
             "updated_at": utc_now_iso(),
         }
 
@@ -251,13 +268,21 @@ class Orchestrator:
         return self.git.write_current_json(self.current)
 
     def _transition(self, to: "str | LoopPhase", **fields: Any) -> str:
-        """状态转换：改 current.json 即 commit pm/state（v2 §10.6）。"""
+        """状态转换：改 current.json 即 commit pm/state（v2 §10.6），并 append activity。"""
         phase = to.value if isinstance(to, LoopPhase) else str(to)
+        previous = str(self.current.get("phase", ""))
         self.current.update(fields)
         self.current["phase"] = phase
         self.current["iteration"] = int(self.current.get("iteration", 0)) + 1
         sha = self.git.write_current_json(
             self.current, message=f"phase {phase} (round={self.current.get('round', 0)})"
+        )
+        # activity.jsonl 只追加：状态转换全量留痕（崩溃后可折叠出上下文）
+        self.activity.phase(
+            previous,
+            phase,
+            round_no=int(self.current.get("round", 0) or 0),
+            task_id=self.current.get("task_id"),
         )
         suffix = f" task={self.current.get('task_id')}" if self.current.get("task_id") else ""
         print(f"[PM] phase {phase}{suffix}")
@@ -280,12 +305,23 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _webai(self, round_no: int):
-        return build_adapter(self.root, self.cfg, demo=self.demo, round_no=round_no)
+        return build_adapter(
+            self.root,
+            self.cfg,
+            demo=self.demo,
+            round_no=round_no,
+            selector_missing=self.demo_selector_missing,
+        )
 
     def _quota_info(self) -> QuotaInfo:
-        if self.demo:
-            return QuotaService._from_dict(DEMO_QUOTA)
+        """当前额度（demo 走假额度，可被 --demo-quota-percent 覆盖）。"""
         return self.quota_service.fetch()
+
+    def set_demo_quota(self, percent: float) -> None:
+        """demo 专属：覆盖 OpenCode 假额度百分比（>degrade_percent 触发降级）。"""
+        self.quota_service.demo_percent = float(percent)
+        self.dispatcher.quota.demo_percent = float(percent)
+        self.dispatcher.quota._cache = None
 
     def _transcript_text(self) -> str:
         parts = [read_text_if_exists(self.handoff.session_path)]
@@ -298,7 +334,12 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _review_diff(self, task: TaskSpec) -> bool:
-        """REVIEWING_DIFF：改动 ∈ allowed_paths 且非空（v2 D9）。"""
+        """REVIEWING_DIFF：改动 ∈ allowed_paths 且非空（v2 D9）。
+
+        基线说明：task 分支自 main 分出，故 `git diff --name-only main...task-<id>`
+        （三点式 = merge-base 差异）即为「本 task 相对 main 新增的改动」。
+        用两点式 `main..task` 会把 main 上后续提交也算进来，属误判。
+        """
         diff = list(self.dispatcher.last_diff)
         if not diff:
             if self.dispatcher.last_route in (None, "script", "opencode"):
@@ -393,6 +434,8 @@ class Orchestrator:
         )
         if decision is None:
             # 无决策：落盘等待（状态 WAITING_APPROVAL，可 resume）
+            # 关键：标记为「等待中」，调用方收到后必须停止，绝不能继续合并/收尾
+            self._awaiting_approval = True
             self._persist_files(rnd, spec, result)
             self._push_best_effort()
             return E_OK
@@ -571,11 +614,127 @@ class Orchestrator:
         return more
 
     # ------------------------------------------------------------------
+    # demo 基线复位（T1：保证 diff 可观测）
+    # ------------------------------------------------------------------
+
+    def _demo_reset_baseline(self) -> None:
+        """demo 模式：清理 main 上与夹具**逐字节相同**的上一轮演示产物。
+
+        为什么需要：demo 产物会被合并回 main，下一轮 task 分支写入同样内容时
+        `git diff main...task` 为空 -> REVIEWING_DIFF 误判「无任何改动」。
+
+        安全约束：**只删内容与夹具完全一致的文件**（`demo_baseline_reset_targets`
+        逐字节比对），用户真实产出绝不会被误删。
+        """
+        from demo_fixtures import demo_baseline_reset_targets
+
+        targets = demo_baseline_reset_targets(self.git, self.root)
+        if not targets:
+            return
+        sha = self.git.remove_paths(targets, "chore(demo): 复位演示基线产物（保证 diff 可观测）")
+        print(f"[PM] demo 基线复位：移除 {targets}（commit={sha or '无变更'}）")
+
+    # ------------------------------------------------------------------
+    # T2：网页 AI 选择器缺失 -> AWAITING_APPROVAL（人审，不崩溃）
+    # ------------------------------------------------------------------
+
+    def _await_selector_fix(self, rnd: int, err: PMError) -> int:
+        """主路径选择器缺失且兜底不可用：进入 AWAITING_APPROVAL 等待人审。
+
+        语义：不是「任务失败」，而是「需要一个外部决策」——人工提供选择器或
+        安装兜底后端后 `resume` 继续。因此不置 FAILED，也不返回错误码。
+        """
+        apr_id = f"sel-{int(self.current.get('iteration', 0)) + 1:04d}"
+        apr = {
+            "id": apr_id,
+            "op_type": "web_ai_selector",
+            "command": "人工提供 web_ai.selectors 或安装 drissionpage-ai 后 resume",
+            "requested_by": "ask-web-ai",
+            "requested_at": utc_now_iso(),
+            "detail": str(err),
+        }
+        self._transition(
+            LoopPhase.HUMAN_REVIEW,
+            status="WAITING_APPROVAL",
+            pending_approval=apr,
+            task_id=None,
+            lock=None,
+        )
+        self.activity.approval("AWAITING_APPROVAL", task_id=None, op_type="web_ai_selector")
+        print(f"[PM] 网页 AI 选择器缺失：{err}")
+        print(f"[PM] HUMAN_REVIEW：进入 AWAITING_APPROVAL id={apr_id}（等待人工提供选择器）")
+        print(
+            "[PM] 解除方式：修正 pm.config.json 的 web_ai.selectors，或安装 drissionpage-ai；"
+            "然后执行 resume"
+        )
+        self._persist_files(rnd, None, None, error=f"web_ai_selector 缺失：{err}")
+        self._push_best_effort()
+        return E_OK
+
+    # ------------------------------------------------------------------
+    # T3：`--auto` 事后安全检查（worktree 越界检测）
+    # ------------------------------------------------------------------
+
+    def _security_audit(self, spec: TaskSpec) -> list[str]:
+        """执行后检测 worktree 之外是否被改动；返回越界路径清单。
+
+        WorkBuddy 路由按设计**直接写主工作区**（同进程、零额外内存，不建 worktree），
+        因此 provider 显式声明的产物路径不属于越界；其余改动照旧判违规。
+        OpenCode / script 路由仍走 worktree，任何主工作区改动都是越界。
+        """
+        auditor = SecurityAuditor(self.root, worktree_rel_for(spec))
+        before = auditor.snapshot()
+        result = self.dispatcher.dispatch(
+            spec,
+            reviewer=self._review_diff,
+            max_rework=self.max_rework,
+            phase_hook=self._phase_hook,
+        )
+        violations = auditor.diff(before)
+        self._last_result = result
+        if self.dispatcher.last_route == "workbuddy":
+            declared = {
+                a.replace("\\", "/").strip("/") for a in (result.artifacts or [])
+            }
+            if declared:
+                waived = [v for v in violations if v in declared]
+                if waived:
+                    print(
+                        f"[PM] 安全审计：WB 路由在主工作区的已声明产物放行 "
+                        f"{len(waived)} 处：{'、'.join(waived[:5])}"
+                    )
+                violations = [v for v in violations if v not in declared]
+        return violations
+
+    def _handle_security_violation(self, rnd: int, spec: TaskSpec, violations: list[str]) -> int:
+        """发现 worktree 越界：记 security_violation 并 PAUSE（不自动续跑）。"""
+        detail = "、".join(violations[:10])
+        self.activity.security("worktree_escape", "PAUSE", detail=detail)
+        print(f"[PM] 安全检查失败：worktree 之外被修改 {len(violations)} 处：{detail}")
+        print("[PM] 已记 security_violation -> PAUSE（需人工确认后 resume）")
+        self._transition(
+            LoopPhase.PAUSED,
+            status="PAUSED",
+            pending_approval=None,
+            lock=None,
+            task_id=None,
+        )
+        self._persist_files(
+            rnd, spec, self._last_result, error=f"security_violation：{detail}"
+        )
+        self._push_best_effort()
+        return E_OK
+
+    # ------------------------------------------------------------------
     # 派活 + 合并（一轮的任务执行）
     # ------------------------------------------------------------------
 
     def _run_task(self, rnd: int, spec: TaskSpec) -> tuple[bool, int]:
         """DISPATCHING -> (PREPARING_WORKTREE/EXECUTING/REVIEWING_DIFF) -> MERGING -> 收尾。
+
+        连续失败熔断（离线可演练）：同一 task 失败后清理 worktree 重派，
+        连续 `circuit_threshold`（默认 3）次失败 -> 熔断 PAUSED + circuit_open=true，
+        不再继续烧额度；期间任何一次成功即清零计数。
 
         返回 (是否继续循环, 退出码)。
         """
@@ -589,26 +748,47 @@ class Orchestrator:
         self._transition(
             LoopPhase.DISPATCHING, active_agent="dispatch-agent", task_id=spec.id, lock=lock
         )
-        result = self.dispatcher.dispatch(
-            spec,
-            reviewer=self._review_diff,
-            max_rework=self.max_rework,
-            phase_hook=self._phase_hook,
-        )
-        self._last_result = result
-        if result.status not in ("success", "executed_in_process"):
+        # T3：派发前后做 `--auto` 事后安全检查（worktree 越界 -> PAUSE）
+        while True:
+            violations = self._security_audit(spec)
+            if violations:
+                return False, self._handle_security_violation(rnd, spec, violations)
+            result = self._last_result
+            if result is None:
+                result = AgentResult(
+                    status="failed", agent="dispatch-agent", error_code=E_AGENT_CRASH,
+                    error_detail="派发无结果",
+                )
+            if result.status in ("success", "executed_in_process"):
+                self._sync_state(consecutive_failures=0, circuit_open=False)
+                break
+
+            # —— 失败：累计连续失败次数，判断是否熔断 ——
+            fails = int(self.current.get("consecutive_failures", 0)) + 1
+            opened = fails >= self.circuit_threshold
+            self._sync_state(consecutive_failures=fails, circuit_open=opened)
+            self.activity.circuit(
+                f"连续失败 {fails}/{self.circuit_threshold}："
+                f"{result.error_detail or result.status}",
+                opened,
+                rnd,
+            )
             print(
-                f"[PM] 代理失败：{result.error_code} {result.error_detail or ''}".rstrip()
+                f"[PM] 代理失败（连续 {fails}/{self.circuit_threshold} 次）："
+                f"{result.error_code} {(result.error_detail or '').strip()}".rstrip()
             )
-            self._transition(
-                LoopPhase.FAILED, status="FAILED", lock=None, task_id=None
-            )
-            self._persist_files(rnd, spec, result)
-            self._push_best_effort()
-            return False, (result.error_code or E_AGENT_CRASH)
+            # 清理失败轮次的 worktree / task 分支，保证重派从干净基线出发
+            self.git.worktree_remove(worktree_rel_for(spec))
+            self.git.delete_branch(spec.id, force=True)
+            if opened:
+                return False, self._open_circuit(rnd, spec, result)
+            print("[PM] 未到熔断阈值，重派同一 task")
+
         if result.irreversible_ops:
+            self._awaiting_approval = False
             code = self._human_review(rnd, spec, result)
-            if code != E_OK:
+            if code != E_OK or self._awaiting_approval:
+                # 无审批决策：落盘等待（状态 AWAITING_APPROVAL），不得继续合并
                 return False, code
         if self.dispatcher.last_route != "workbuddy":
             self._transition(LoopPhase.MERGING, active_agent="pm-orchestrator")
@@ -629,6 +809,35 @@ class Orchestrator:
         self._transition(LoopPhase.COLLECTING, lock=None)
         more = self._finish_round(rnd, spec=spec, result=result)
         return more, E_OK
+
+    def _open_circuit(self, rnd: int, spec: TaskSpec, result: AgentResult) -> int:
+        """连续失败达阈值：熔断 -> PAUSED（不 FAILED，保留 resume 入口）。"""
+        self.activity.circuit(
+            f"连续 {self.circuit_threshold} 次失败，熔断", True, rnd
+        )
+        self._transition(
+            LoopPhase.PAUSED,
+            status="PAUSED",
+            circuit_open=True,
+            pending_approval=None,
+            lock=None,
+            task_id=None,
+        )
+        print(
+            f"[PM] 熔断：连续 {self.circuit_threshold} 次失败 -> PAUSED"
+            "（人工排查后写入 commands/queue.jsonl 的 resume 指令继续）"
+        )
+        self._persist_files(
+            rnd,
+            spec,
+            result,
+            error=(
+                f"circuit_open：连续 {self.circuit_threshold} 次失败"
+                f"（{result.error_code} {result.error_detail or ''}）".strip()
+            ),
+        )
+        self._push_best_effort()
+        return E_OK
 
     # ------------------------------------------------------------------
     # 主循环
@@ -660,6 +869,9 @@ class Orchestrator:
             try:
                 reply = self._webai(rnd).send_prompt(question)
             except PMError as e:
+                if e.code == E_WEB_AI_SELECTOR:
+                    # T2：主路径选择器缺失且兜底不可用 -> 转人审（不崩溃）
+                    return self._await_selector_fix(rnd, e)
                 print(f"[PM] 网页 AI 失败：{e}")
                 self._transition(LoopPhase.FAILED, status="FAILED")
                 self._persist_files(rnd, None, None, error=str(e))
@@ -742,6 +954,9 @@ class Orchestrator:
         self.current = self._load_current()
         if self.current.get("lock"):
             self._recover_lock()
+        if self.demo:
+            # T1：demo 基线复位（必须在建 worktree 之前，否则 diff 为空）
+            self._demo_reset_baseline()
         self._transition(
             LoopPhase.PLANNING,
             status="RUNNING",
@@ -749,6 +964,8 @@ class Orchestrator:
             active_agent="pm-orchestrator",
             task_id=None,
             pending_approval=None,
+            consecutive_failures=0,
+            circuit_open=False,
         )
         print(f"[PM] run: {self._goal}（max_rounds={self._max_rounds}）")
         return self._loop(1)
@@ -769,7 +986,10 @@ class Orchestrator:
             if not any(c.get("cmd") == "resume" for c in cmds):
                 print('[PM] 当前 PAUSED；向 commands/queue.jsonl 追加 {"cmd":"resume"} 后可继续')
                 return E_OK
-            self._transition(LoopPhase.PLANNING, status="RUNNING")
+            self._transition(
+                LoopPhase.PLANNING, status="RUNNING",
+                consecutive_failures=0, circuit_open=False,
+            )
             return self._loop(max(1, int(cur.get("round", 1))))
 
         # 1) 等待审批
@@ -1069,6 +1289,22 @@ def main(argv: list[str] | None = None) -> int:
         "--demo-irreversible", action="store_true",
         help="demo：注入不可逆操作以演练 HUMAN_REVIEW 审批链路",
     )
+    p_run.add_argument(
+        "--demo-selector-missing", action="store_true",
+        help="demo：演练网页 AI 主路径选择器缺失（应转 AWAITING_APPROVAL 而非崩溃）",
+    )
+    p_run.add_argument(
+        "--demo-escape-write", action="store_true",
+        help="demo：演练代理越界写 worktree 之外（应记 security_violation 并 PAUSE）",
+    )
+    p_run.add_argument(
+        "--demo-agent-fail", action="store_true",
+        help="demo：代理每次派活都失败（演练「连续失败 3 次 -> 熔断 PAUSED」）",
+    )
+    p_run.add_argument(
+        "--demo-quota-percent", type=float, default=None,
+        help="demo：覆盖 OpenCode 假额度百分比（>90 触发「降级 WorkBuddy」）",
+    )
 
     sub.add_parser("resume", parents=[common], help="跨机/中断接续")
     sub.add_parser("status", parents=[common], help="查看状态")
@@ -1081,6 +1317,15 @@ def main(argv: list[str] | None = None) -> int:
     orch = Orchestrator(demo=bool(getattr(args, "demo", False)))
     if getattr(args, "demo_irreversible", False):
         orch.dispatcher.demo_irreversible = True
+    if getattr(args, "demo_selector_missing", False):
+        orch.demo_selector_missing = True
+    if getattr(args, "demo_escape_write", False):
+        orch.demo_escape_write = True
+        orch.dispatcher.demo_escape_write = True
+    if getattr(args, "demo_agent_fail", False):
+        orch.dispatcher.demo_agent_fail = True
+    if getattr(args, "demo_quota_percent", None) is not None:
+        orch.set_demo_quota(float(args.demo_quota_percent))
     try:
         if args.cmd == "init":
             return orch.init(demo=bool(getattr(args, "demo", False)), remote=args.remote)

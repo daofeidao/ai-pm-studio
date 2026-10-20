@@ -38,6 +38,7 @@ E_QUOTA_EXCEEDED = 20       # 额度超限（v2 改为降级不拦截，保留�
 E_WEB_AI_TIMEOUT = 30       # 网页 AI 等待回答超时
 E_WEB_AI_NOT_LOGGED_IN = 31 # 网页 AI 未登录
 E_CDP_UNREACHABLE = 32      # CDP（调试 Edge）不可达
+E_WEB_AI_SELECTOR = 33      # 网页 AI 主路径选择器缺失且无兜底（转人审 AWAITING_APPROVAL）
 E_AGENT_CRASH = 40          # 代理进程非零退出
 E_AGENT_RESULT_INVALID = 41 # 代理结果无法解析
 E_AGENT_TIMEOUT = 42        # 代理执行超时（kill 进程树）
@@ -62,6 +63,7 @@ ERROR_NAMES: dict[int, str] = {
     E_WEB_AI_TIMEOUT: "E_WEB_AI_TIMEOUT",
     E_WEB_AI_NOT_LOGGED_IN: "E_WEB_AI_NOT_LOGGED_IN",
     E_CDP_UNREACHABLE: "E_CDP_UNREACHABLE",
+    E_WEB_AI_SELECTOR: "E_WEB_AI_SELECTOR",
     E_AGENT_CRASH: "E_AGENT_CRASH",
     E_AGENT_RESULT_INVALID: "E_AGENT_RESULT_INVALID",
     E_AGENT_TIMEOUT: "E_AGENT_TIMEOUT",
@@ -166,6 +168,63 @@ def read_text_if_exists(path: Path | str) -> str:
         return ""
     with open(p, "r", encoding="utf-8") as f:
         return f.read()
+
+
+# ---------------------------------------------------------------------------
+# 本机 HTTP（强制绕过系统代理）
+# ---------------------------------------------------------------------------
+
+#: 本机主机名白名单（local_request 只接受这些目标）
+LOCAL_HOSTNAMES: frozenset[str] = frozenset(
+    {"127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"}
+)
+
+
+def is_local_url(url: str) -> bool:
+    """URL 的主机是否为本机（127.0.0.1 / localhost / ::1 / 0.0.0.0）。"""
+    from urllib.parse import urlsplit
+
+    try:
+        host = (urlsplit(url).hostname or "").strip().lower()
+    except ValueError:
+        return False
+    return host in LOCAL_HOSTNAMES
+
+
+def local_request(
+    url: str,
+    timeout_s: float = 3.0,
+    headers: dict[str, str] | None = None,
+    method: str = "GET",
+    data: bytes | None = None,
+    max_bytes: int = 65536,
+) -> tuple[int, str]:
+    """访问**本机** HTTP 端点，**显式绕过系统代理**，返回 (status, body)。
+
+    为什么不用 `urllib.request.urlopen`：它默认读取 `HTTP_PROXY`/`HTTPS_PROXY`/
+    `ALL_PROXY` 等环境变量（Windows 还会合并注册表代理设置），把 `127.0.0.1`
+    的请求也转发给代理（Clash / 公司网关 / 抓包工具）。结果是本机 Magpie 网关
+    明明在跑，探测却返回「不可达」——这类假故障极难排查。
+    `ProxyHandler({})` 显式声明「无代理」，本机请求永远直连。
+
+    只接受本机地址（is_local_url 校验），远程地址请走 urllib 默认行为。
+    连接失败等异常原样抛出，由调用方转 capability_gap / stale（不在这里吞）。
+    """
+    if not is_local_url(url):
+        raise ValueError(f"local_request 仅用于本机地址，收到：{url}")
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(
+        url,
+        headers=dict(headers or {"Accept": "application/json"}),
+        data=data,
+        method=method,
+    )
+    with opener.open(req, timeout=timeout_s) as resp:
+        body = resp.read(max_bytes)
+        status = int(getattr(resp, "status", 200) or 200)
+    return status, body.decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +347,85 @@ def _selftest() -> int:
 
         # 8) 错误码常量齐全且唯一
         codes = [v for k, v in globals().items() if k.startswith("E_") and isinstance(v, int)]
-        expected = {0, 10, 20, 30, 31, 32, 40, 41, 42, 43, 50, 60, 70, 80, 90, 91, 92, 93, 94, 95, 96}
+        expected = {0, 10, 20, 30, 31, 32, 33, 40, 41, 42, 43, 50, 60, 70, 80, 90, 91, 92, 93, 94, 95, 96}
         checks.append(("错误码集合等于 v2 §10.8", set(codes) == expected))
         checks.append(("错误码唯一（无重复值）", len(codes) == len(set(codes))))
         checks.append(("ERROR_NAMES 覆盖全部错误码", set(ERROR_NAMES) == expected))
+
+        # 9) is_local_url 判定
+        checks.append(
+            (
+                "is_local_url：本机地址为真、远程为假",
+                all(is_local_url(u) for u in ("http://127.0.0.1:3425/v1", "http://localhost:1/x",
+                                              "http://[::1]:9/y"))
+                and not any(is_local_url(u) for u in ("https://opencode.ai/usage", "http://10.0.0.5/x")),
+            )
+        )
+
+        # 10) local_request 绕过 HTTP_PROXY（HTTP_PROXY 生效时仍能访问本机）
+        import threading
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"ok":true,"path":"' + self.path.encode() + b'"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:  # 静音
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        local_url = f"http://127.0.0.1:{server.server_address[1]}/models"
+        saved = {
+            k: os.environ.get(k)
+            for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                      "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+        }
+        try:
+            dead_proxy = "http://127.0.0.1:9"
+            for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                      "ALL_PROXY", "all_proxy"):
+                os.environ[k] = dead_proxy
+            for k in ("NO_PROXY", "no_proxy"):
+                os.environ.pop(k, None)
+            try:
+                status, body = local_request(local_url, timeout_s=5)
+                ok_local = status == 200 and '"ok":true' in body
+            except Exception as e:  # noqa: BLE001
+                ok_local = False
+                print(f"  local_request 异常: {e}")
+            checks.append(("local_request 在 HTTP_PROXY 生效时仍直连本机", ok_local))
+
+            # 反证：默认 urlopen 被代理吞掉（说明这个坑真实存在，测试有意义）
+            try:
+                with urllib.request.urlopen(local_url, timeout=3) as resp:
+                    resp.read(64)
+                blocked = False
+            except Exception:  # noqa: BLE001
+                blocked = True
+            checks.append(("默认 urlopen 被 HTTP_PROXY 拦截（坑存在）", blocked))
+
+            # 非本机地址必须拒绝（防止被当成通用 HTTP 客户端滥用）
+            try:
+                local_request("https://example.com/", timeout_s=1)
+                checks.append(("local_request 拒绝非本机地址", False))
+            except ValueError:
+                checks.append(("local_request 拒绝非本机地址", True))
+        finally:
+            server.shutdown()
+            server.server_close()
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
     finally:
         import shutil
 

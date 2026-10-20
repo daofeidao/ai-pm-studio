@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -58,6 +59,17 @@ BLOCKED_DIR_HINTS: tuple[str, ...] = (
     "credentials",
     ".aws",
     ".config/git/credentials",
+)
+
+#: `--auto` 事后安全检查忽略的路径前缀（编排器自身产出，不算越界）
+SECURITY_IGNORE_PREFIXES: tuple[str, ...] = (
+    ".git/",
+    "worktrees/",
+    "reports/",
+    "dashboard/",
+    "memory/",
+    "commands/",
+    "activity.jsonl",
 )
 
 
@@ -145,11 +157,113 @@ class PermissionGuard:
 
 
 # ---------------------------------------------------------------------------
+# `--auto` 事后安全检查（worktree 越界检测）
+# ---------------------------------------------------------------------------
+
+class SecurityAuditor:
+    """事后安全检查：检测 **worktree 之外** 的文件是否被改动。
+
+    用法（编排器 EXECUTING 前后各一次）::
+
+        auditor = SecurityAuditor(root, worktree_rel="worktrees/task-001")
+        before = auditor.snapshot()
+        ...执行代理...
+        violations = auditor.diff(before)
+
+    实现要点：
+    - 快照 = 仓库根下（**排除 worktree 自身与编排器自有目录**）每个文件的
+      (size, mtime_ns, sha1) 三元组；diff 时按「新增 / 删除 / 内容变化」分类。
+    - 只用标准库；文件数量大时按 mtime 粗筛再算 sha1，避免无谓 IO。
+    - 发现越界即由编排器记 `security_violation` 并转 PAUSE（不自动续跑）。
+    """
+
+    def __init__(
+        self,
+        root: Path | str,
+        worktree_rel: str = "",
+        ignore_prefixes: tuple[str, ...] = SECURITY_IGNORE_PREFIXES,
+    ) -> None:
+        self.root = Path(root).resolve()
+        self.worktree_rel = worktree_rel.replace("\\", "/").strip("/")
+        self.ignore_prefixes = tuple(ignore_prefixes)
+
+    # ------------------------------------------------------------------
+
+    def _rel_of(self, path: Path) -> str:
+        return path.relative_to(self.root).as_posix()
+
+    def _is_ignored(self, rel: str) -> bool:
+        if self.worktree_rel and (
+            rel == self.worktree_rel or rel.startswith(self.worktree_rel + "/")
+        ):
+            return True
+        return any(rel.startswith(p) for p in self.ignore_prefixes)
+
+    def _iter_files(self) -> list[Path]:
+        """遍历仓库根下所有需检查的文件（排除 worktree 自身与忽略前缀）。"""
+        out: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            d = Path(dirpath)
+            rel_dir = self._rel_of(d) if d != self.root else ""
+            # 就地裁剪目录，避免下钻 .git / worktrees 等大目录
+            keep: list[str] = []
+            for name in dirnames:
+                child_rel = f"{rel_dir}/{name}" if rel_dir else name
+                if self._is_ignored(child_rel):
+                    continue
+                keep.append(name)
+            dirnames[:] = keep
+            for name in filenames:
+                rel = f"{rel_dir}/{name}" if rel_dir else name
+                if self._is_ignored(rel):
+                    continue
+                out.append(d / name)
+        return out
+
+    @staticmethod
+    def _hash(path: Path) -> str:
+        h = hashlib.sha1()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            return ""
+        return h.hexdigest()
+
+    def snapshot(self) -> dict[str, tuple[int, int, str]]:
+        """当前状态快照：{相对路径: (size, mtime_ns, sha1)}。"""
+        snap: dict[str, tuple[int, int, str]] = {}
+        for p in self._iter_files():
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            snap[self._rel_of(p)] = (st.st_size, st.st_mtime_ns, self._hash(p))
+        return snap
+
+    def diff(self, before: dict[str, tuple[int, int, str]]) -> list[str]:
+        """比较两次快照，返回被改动的相对路径（新增/删除/内容变化）。"""
+        after = self.snapshot()
+        changed: list[str] = []
+        for rel, sig in after.items():
+            old = before.get(rel)
+            if old is None:
+                changed.append(rel)
+            elif old[0] != sig[0] or old[2] != sig[2]:
+                changed.append(rel)
+        for rel in before:
+            if rel not in after:
+                changed.append(rel)
+        return sorted(changed)
+
+
+# ---------------------------------------------------------------------------
 # 自检
 # ---------------------------------------------------------------------------
 
 def _selftest() -> int:
-    """三级权限判定：AUTO/APPROVAL/BLOCKED 各分支。"""
+    """三级权限判定：AUTO/APPROVAL/BLOCKED 各分支 + T3 事后安全检查。"""
     checks: list[tuple[str, bool]] = []
     g = PermissionGuard("C:/repo", "C:/Users/me")
 
@@ -180,6 +294,51 @@ def _selftest() -> int:
     # BLOCKED: git push --force
     c = g.classify("git", command="git push --force origin main")
     checks.append(("git push --force -> BLOCKED", c.tier == Permission.BLOCKED))
+
+    # --- T3：SecurityAuditor 事后安全检查（worktree 越界检测）---
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="pm-perm-selftest-"))
+    try:
+        (tmp / "worktrees" / "task-001").mkdir(parents=True)
+        (tmp / "worktrees" / "task-001" / "inside.txt").write_text("in", encoding="utf-8")
+        (tmp / "work").mkdir()
+        (tmp / "work" / "a.txt").write_text("a", encoding="utf-8")
+        (tmp / "reports").mkdir()
+        (tmp / "reports" / "r.md").write_text("r", encoding="utf-8")
+
+        aud = SecurityAuditor(tmp, worktree_rel="worktrees/task-001")
+        before = aud.snapshot()
+        checks.append(("快照含 work/ 下文件", "work/a.txt" in before))
+        checks.append(("快照排除 worktree 自身",
+                       not any(k.startswith("worktrees/task-001/") for k in before)))
+        checks.append(("快照排除 reports/（编排器自有）", "reports/r.md" not in before))
+
+        # 越界：改 work/ 下的文件 -> 应被检出
+        (tmp / "work" / "a.txt").write_text("changed", encoding="utf-8")
+        viol = aud.diff(before)
+        checks.append(("检出 worktree 之外被修改", "work/a.txt" in viol))
+
+        # 越界：新增文件
+        (tmp / "work" / "b.txt").write_text("new", encoding="utf-8")
+        viol2 = aud.diff(before)
+        checks.append(("检出 worktree 之外新增文件", "work/b.txt" in viol2))
+
+        # worktree 内部改动 -> 不应被检出
+        snap2 = aud.snapshot()
+        (tmp / "worktrees" / "task-001" / "inside.txt").write_text("changed", encoding="utf-8")
+        viol3 = aud.diff(snap2)
+        checks.append(("worktree 内部改动不误报", viol3 == []))
+
+        # 删除文件也能检出
+        snap3 = aud.snapshot()
+        (tmp / "work" / "b.txt").unlink()
+        viol4 = aud.diff(snap3)
+        checks.append(("检出 worktree 之外删除文件", "work/b.txt" in viol4))
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
 
     failed = 0
     for name, ok in checks:

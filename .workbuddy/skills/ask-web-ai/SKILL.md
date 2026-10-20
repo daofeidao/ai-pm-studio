@@ -42,7 +42,7 @@ Python 解释器固定 managed 3.13.12（`pm.config.json` 的 `python` 字段）
 
 ## 错误码
 
-`E_WEB_AI_TIMEOUT=30` / `E_WEB_AI_NOT_LOGGED_IN=31` / `E_CDP_UNREACHABLE=32`；
+`E_WEB_AI_TIMEOUT=30` / `E_WEB_AI_NOT_LOGGED_IN=31` / `E_CDP_UNREACHABLE=32` / `E_WEB_AI_SELECTOR=33`（主路径选择器缺失且兜底 `drissionpage-ai` 不可用 → 编排器转 AWAITING_APPROVAL 人审）；
 主流程记 `last_error` 不崩溃（v2 §10.8）。
 
 ## 扩展（P3）

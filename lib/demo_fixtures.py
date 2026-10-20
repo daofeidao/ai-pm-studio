@@ -11,6 +11,9 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 # ---------------------------------------------------------------------------
 # 假 DeepSeek 回答（第 1 轮）：包含动作清单与验收标准两段，供 PARSING 解析
 # ---------------------------------------------------------------------------
@@ -153,3 +156,50 @@ form { display: grid; gap: 0.75rem; max-width: 20rem; }
 label { display: grid; gap: 0.25rem; }
 """,
 }
+
+#: WB 同进程执行器在 main 的 work/ 下留下的演示产物路径
+DEMO_WB_ARTIFACT_PATH = "work/wb-demo-login.html"
+
+#: demo 基线复位需要清理的产物路径（夹具产物 + WB 同进程产物）
+DEMO_BASELINE_PATHS: tuple[str, ...] = tuple(DEMO_WORKTREE_FILES.keys()) + (
+    DEMO_WB_ARTIFACT_PATH,
+)
+
+#: demo：模拟「主路径选择器缺失」的开关（走 web_ai 兜底逻辑，见 webai_adapter）
+DEMO_WEB_AI_SELECTOR_MISSING: bool = True
+
+#: demo：模拟代理越界——在 worktree 之外写文件（--auto 事后安全检查用）
+DEMO_ESCAPE_WRITE_PATH = "work/demo-escape.txt"
+DEMO_ESCAPE_WRITE_CONTENT = (
+    "demo: 代理越界写入 worktree 之外的文件（--auto 事后安全检查用）\n"
+)
+
+#: demo：magpie 网关不可达时的假探测结果（capability_probe / 派发器回退用）
+DEMO_MAGPIE_UNREACHABLE: dict = {
+    "base_url": "http://127.0.0.1:3425/v1",
+    "model": "group/workbuddy-3x",
+    "reachable": False,
+    "reason": "网关不可达（demo 假探测）",
+}
+
+
+def demo_baseline_reset_targets(git: Any, root: Path) -> list[str]:
+    """返回需要从 main 移除的 demo 产物路径。
+
+    判定规则：**只移除内容与夹具完全一致的文件**（避免误删用户真实产出）。
+    - 夹具产物（DEMO_WORKTREE_FILES）：blob 内容逐字节比对；
+    - WB 同进程产物：内容含 "WorkBuddy 同进程产物" 标记即认为是 demo 产物。
+
+    为什么要复位：demo 上一轮合并后 main 里已存在同名同内容产物，下一轮
+    task 分支写入同样内容 -> `git diff main...task` 为空 -> REVIEWING_DIFF
+    误判「无任何改动」。复位后每轮 diff 都可观测。
+    """
+    targets: list[str] = []
+    for rel, content in DEMO_WORKTREE_FILES.items():
+        blob = git.tracked_blob(rel)
+        if blob and blob == content:
+            targets.append(rel)
+    wb_blob = git.tracked_blob(DEMO_WB_ARTIFACT_PATH)
+    if wb_blob and "WorkBuddy 同进程产物" in wb_blob:
+        targets.append(DEMO_WB_ARTIFACT_PATH)
+    return targets

@@ -4,3 +4,4 @@ worktrees/
 __pycache__/
 .demo-remote/
 .DS_Store
+activity.jsonl

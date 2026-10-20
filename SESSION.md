@@ -51,3 +51,10 @@
 - 报告路径：reports/round-1-20261020T081916Z.md
 - 建议下一步：人工介入或修正后 resume
 - 备注：session=ses_demo_001
+## ↪ Return · 2026-10-20T10:53:22Z · pm-orchestrator(QA)
+- 做了什么：QA 收口 —— ①`HTTP_PROXY` 坑：新增 `pm_common.local_request()`（`ProxyHandler({})` 强制直连，仅接受本机地址）并接线 `capability_probe` / `agent_provider`；②mock 执行器（OC/WB）加「写后 `git status` 该产物必须非空」自检，空则 `E_AGENT_RESULT_INVALID`；③新增 `tools/run_demo_qa.py` 四场景 QA（每场景独立沙箱，不污染仓库）；④修 `--demo-irreversible` 无审批决定仍 merge/DONE 的安全缺陷；⑤修 `core.autocrlf=true` 造成的「内容相同却 modified」假脏；⑥WB 降级路线按设计直写 main，安全审计放行 provider 已声明产物，其余越界仍 PAUSE。
+- 改动文件：lib/pm_common.py；lib/capability_probe.py；lib/agent_provider.py；lib/git_ops.py；lib/permissions.py；lib/quota.py；lib/demo_fixtures.py；lib/webai_adapter.py；.workbuddy/skills/dispatch-agent/dispatcher.py；.workbuddy/skills/pm-orchestrator/orchestrator.py；pm.config.json；.gitignore；tools/run_demo_qa.py；tools/run_opencode_sample.py；tools/magpie/check-magpie-health.ps1；tools/magpie/setup-magpie-workbuddy.ps1；docs/opencode-json-sample.md；docs/state-review-v2.1.md；ARCHITECTURE-v2.md；reports/qa-demo-20261020T185311.md；reports/t5/sample-result.json
+- 测试结果：demo QA 四场景 46/46 全通过（happy 16/16、熔断 12/12、降级 9/9、选择器失效 9/9）；selftest 全绿：pm_common / quota / capability_probe / git_ops / permissions / dispatcher；`HTTP_PROXY` 反证自测通过（默认 `urlopen` 被死代理阻断、`local_request` 仍 200）。
+- 报告路径：reports/qa-demo-20261020T185311.md
+- 建议下一步：按序接 LeanREA 逆向路由 → 17 态审查表落地 → Magpie 真实网关联调（在线环境）。
+- 备注：blocked_external —— Magpie 真实网关与真实 `opencode run --format json` 采样需在线，`reports/t5/sample-result.json` 记录本次采样超时（3 分钟 kill）；遗留 —— 主仓库仍有 `worktrees/task-001` 与分支 `task-001`（已 gitignore，未清理）。
