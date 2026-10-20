@@ -79,3 +79,12 @@
 - 报告路径：reports/t5/sample-result.json
 - 建议下一步：在线复采 1 次补 `cache` 用量语义 → LeanREA 逆向路由接线 → 17 态审查表落地 → Magpie 联调。
 - 备注：原始文本与早前口述版**不一致**（原始含反引号：`OK\n\n已写入 `C:\temp\octest\a.txt`，内容为 `hello`。`），断言已按字节更正；`part.tokens.cache`（read 1536 / write 0）为嵌套对象，当前只累加顶层数值键，cache 暂不计入 tokens 汇总（预算用 cost）。
+## ↪ Return · 2026-10-20T12:54:32Z · ask-web-ai(真实路径打通)
+- 做了什么：在用户完成 DeepSeek 登录后，跑通 `web_ai.py ask` 真实链路（原为 `E_WEB_AI_TIMEOUT`）。定位到两个独立根因并修复。
+- 根因 1（环境）：启动参数缺 `--remote-allow-origins=*`。`cdp.py` 握手带 `Origin: http://127.0.0.1:9222`，Edge 111+ 直接 403；而 `_cdp()` 只把 rc=2 当致命，其余失败被吞 → `status` 正常、type/click/wait 全部空转，最终只报超时。
+- 根因 2（选择器，全部实测失效）：`textarea#chat-input`（实测 id 为空）；`button[aria-label*='发送']`（实测无 `<button>`、无 aria-label，发送钮是 `div[role=button]`）；`div.ds-markdown`（实测包含「深度思考」块 `ds-think-content`，且 `text` 取的是整页含侧边栏历史）。
+- 修复：`lib/webai_adapter.py` 常量区 + `pm.config.json web_ai.selectors` 同步为实测值（`textarea[placeholder*='发送消息']` / `div.bf38813a div[role=button]` / `div.ds-message div.ds-markdown`）；发送改为「点发送钮，输入框仍有内容则派发 Enter 兜底」；等待改为「回答容器数 > 发送前基线」；抽取改为取最后一个正式回答容器 innerText；`build_steps` 同步为 eval 抽取。
+- 改动文件：lib/webai_adapter.py；pm.config.json；.workbuddy/skills/ask-web-ai/SKILL.md
+- 测试结果：`web_ai.py --selftest` 全绿（demo 路径零浏览器进程）；真实 `ask "只回复两个字：收到"` → `[answer] 收到`，exit 0，回答落盘 `reports/webai-deepseek-20261020T125356Z.md`（已验证不含思考块/侧边栏文本）。
+- 建议下一步：把「Edge 启动参数必须含 `--remote-allow-origins=*`」接进编排器自检（如 `web_ai` 启动前置检查），避免换机/重启后再次退化成超时。
+- 备注：调试窗口用过两次真实提问，DeepSeek 侧留下两条「只回复两个字：收到」会话，需用户自行删除；`C:\temp\edge-pm` 是该实例专用 Profile。

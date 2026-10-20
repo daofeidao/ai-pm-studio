@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,11 +39,17 @@ from demo_fixtures import DEMO_WEB_REPLY, demo_reply_for_round
 # 主路径选择器常量区（v2.1：页面改版只改这里；Q3 实测后固化）
 # ---------------------------------------------------------------------------
 
-#: DeepSeek 主路径选择器（CDP 五步用）
+#: DeepSeek 主路径选择器（CDP 五步用；2026-10-20 实测页面固化）
+#: 实测要点：
+#:   - 输入框是 `textarea`，**id 为空**，靠 placeholder「给 DeepSeek 发送消息」定位；
+#:   - 发送钮是 `div[role=button]`（不是 <button>，也没有 aria-label），
+#:     位于输入框右侧 `div.bf38813a` 容器内；选择器漂移时由「回车兜底」接管；
+#:   - 回答容器必须排除「深度思考」块：思考块是 `ds-think-content`，
+#:     正式回答是 `div.ds-message div.ds-markdown`。
 DEEPSEEK_SELECTORS: dict[str, str] = {
-    "input": "textarea#chat-input",
-    "send_button": "button[aria-label*='发送']",
-    "answer_container": "div.ds-markdown",
+    "input": "textarea[placeholder*='发送消息']",
+    "send_button": "div.bf38813a div[role=button]",
+    "answer_container": "div.ds-message div.ds-markdown",
 }
 
 #: 兜底后端模块名（缺失选择器时尝试 import；提供 aiAct 动作）
@@ -193,18 +200,64 @@ class DeepSeekAdapter(WebAIAdapter):
             )
         return proc
 
+    # ---- JS 取值封装（回答容器 / 输入框状态） ----
+
+    def _eval(self, js: str, timeout_s: float = 30) -> str:
+        """执行 JS 并返回字符串结果（cdp.py eval 的 stdout）。"""
+        proc = self._cdp(["eval", js], timeout_s=timeout_s)
+        return (proc.stdout or "").strip()
+
+    def _answer_count(self) -> int:
+        """当前页面已有的正式回答数（不含「深度思考」块）。"""
+        js = f"document.querySelectorAll({json.dumps(self.ANSWER_CONTAINER_SELECTOR)}).length"
+        try:
+            return int(self._eval(js))
+        except ValueError:
+            return 0
+
+    def _input_value(self) -> str:
+        """输入框当前内容（空串表示已提交/未输入）。"""
+        js = (
+            f"(document.querySelector({json.dumps(self.INPUT_SELECTOR)})"
+            " || {}).value || ''"
+        )
+        out = self._eval(js)
+        return "" if out in ("undefined", "null") else out
+
+    def _last_answer(self) -> str:
+        """取最后一个正式回答的纯文本。"""
+        js = (
+            f"((Array.from(document.querySelectorAll({json.dumps(self.ANSWER_CONTAINER_SELECTOR)})).pop())"
+            " || {}).innerText || ''"
+        )
+        return self._eval(js).strip()
+
+    def _send_by_enter(self) -> None:
+        """发送钮点击无效时的兜底：向输入框派发 Enter 键事件（实测可提交）。"""
+        js = (
+            "(function(){var ta=document.querySelector(%s);"
+            "if(!ta){return 'NOT_FOUND';}ta.focus();"
+            "['keydown','keypress','keyup'].forEach(function(t){"
+            "ta.dispatchEvent(new KeyboardEvent(t,{key:'Enter',code:'Enter',"
+            "keyCode:13,which:13,bubbles:true,cancelable:true}));});"
+            "return 'OK';})()" % json.dumps(self.INPUT_SELECTOR)
+        )
+        self._eval(js)
+
     def build_steps(self, prompt: str) -> list[list[str]]:
         """CDP 五步命令清单（dry-run / 自检用，不执行）。"""
-        wait_js = (
-            "document.querySelectorAll('" + self.ANSWER_CONTAINER_SELECTOR + "').length > 0"
+        sel = json.dumps(self.ANSWER_CONTAINER_SELECTOR)
+        count_js = f"document.querySelectorAll({sel}).length"
+        last_js = (
+            f"((Array.from(document.querySelectorAll({sel})).pop())||{{}}).innerText||''"
         )
         return [
             ["status"],
             ["open", self.chat_url],
             ["type", self.INPUT_SELECTOR, prompt],
             ["click", self.SEND_BUTTON_SELECTOR],
-            ["wait", wait_js, "--timeout", str(self.timeout_s)],
-            ["text", "--max", "8000"],
+            ["wait", f"{count_js} > 0", "--timeout", str(self.timeout_s)],
+            ["eval", last_js],
         ]
 
     # ---- WebAIAdapter 接口 ----
@@ -226,21 +279,23 @@ class DeepSeekAdapter(WebAIAdapter):
                 E_WEB_AI_NOT_LOGGED_IN,
                 "DeepSeek 未登录：请在调试 Edge 中完成登录并保持会话后重试",
             )
-        # ③ 输入 + 提交
+        # ③ 输入 + 记录发送前的回答数（用于只认“新回答”，不复读旧回答）
         self._cdp(["type", self.INPUT_SELECTOR, full_prompt], timeout_s=60)
+        before = self._answer_count()
+        # ④ 提交：优先点发送钮；无效（选择器漂移/按钮禁用）时回车兜底
         self._cdp(["click", self.SEND_BUTTON_SELECTOR], timeout_s=60)
-        # ④ 轮询等待回答容器
-        wait_js = (
-            "document.querySelectorAll('" + self.ANSWER_CONTAINER_SELECTOR + "').length > 0"
-        )
-        deadline_loops = max(1, int(self.timeout_s / max(self.poll_s, 0.5)))
+        time.sleep(0.6)
+        if self._input_value():
+            self._send_by_enter()
+        # ⑤ 轮询新回答容器（排除 ds-think-content 的思考块）
         answer = ""
+        deadline_loops = max(1, int(self.timeout_s / max(self.poll_s, 0.5)))
         for _ in range(deadline_loops):
-            proc = self._cdp(["wait", wait_js, "--timeout", str(int(self.poll_s))], timeout_s=self.poll_s + 30)
-            proc_text = self._cdp(["text", "--max", "8000"], timeout_s=60)
-            answer = (proc_text.stdout or "").strip()
-            if answer:
-                break
+            if self._answer_count() > before:
+                answer = self._last_answer()
+                if answer:
+                    break
+            time.sleep(self.poll_s)
         if not answer:
             raise PMError(E_WEB_AI_TIMEOUT, f"等待 DeepSeek 回答超时（{self.timeout_s}s）")
         # ⑤ 抽取（text 已取到）；落盘原始回答备查

@@ -60,9 +60,9 @@
     "timeout_s": 120,
     "poll_s": 3,
     "selectors": {
-      "input": "textarea#chat-input",
-      "send_button": "button[aria-label*='发送']",
-      "answer_container": "div.ds-markdown"
+      "input": "textarea[placeholder*='发送消息']",
+      "send_button": "div.bf38813a div[role=button]",
+      "answer_container": "div.ds-message div.ds-markdown"
     }
   },
   "dashboard": {
