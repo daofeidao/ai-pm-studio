@@ -1,11 +1,43 @@
 {
   "schema_version": "2.0",
   "agents": {
-    "workbuddy": { "enabled": true, "kind": "in_process" },
-    "opencode": { "enabled": true, "kind": "cli" },
-    "dsh": { "enabled": null },
-    "openclaw": { "enabled": null },
-    "codebuddy": { "enabled": null }
+    "workbuddy": {
+      "enabled": true,
+      "kind": "in_process"
+    },
+    "opencode": {
+      "enabled": true,
+      "kind": "cli",
+      "version": "opencode v2.0.29"
+    },
+    "dsh": {
+      "enabled": null,
+      "kind": "external"
+    },
+    "openclaw": {
+      "enabled": null,
+      "kind": "external"
+    },
+    "codebuddy": {
+      "enabled": null,
+      "kind": "external"
+    }
   },
-  "capability_gaps": []
+  "capability_gaps": [
+    {
+      "agent": "dsh",
+      "reason": "探测接口未确认（enabled=null，不阻塞主流程）",
+      "at": "2026-10-20T05:56:07Z"
+    },
+    {
+      "agent": "openclaw",
+      "reason": "探测接口未确认（enabled=null，不阻塞主流程）",
+      "at": "2026-10-20T05:56:07Z"
+    },
+    {
+      "agent": "codebuddy",
+      "reason": "探测接口未确认（enabled=null，不阻塞主流程）",
+      "at": "2026-10-20T05:56:07Z"
+    }
+  ]
 }
