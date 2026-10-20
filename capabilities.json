@@ -1,0 +1,11 @@
+{
+  "schema_version": "2.0",
+  "agents": {
+    "workbuddy": { "enabled": true, "kind": "in_process" },
+    "opencode": { "enabled": true, "kind": "cli" },
+    "dsh": { "enabled": null },
+    "openclaw": { "enabled": null },
+    "codebuddy": { "enabled": null }
+  },
+  "capability_gaps": []
+}

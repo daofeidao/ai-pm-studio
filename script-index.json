@@ -1,0 +1,100 @@
+{
+  "schema_version": "2.0",
+  "_comment": "脚本优先路由索引：命中即执行脚本（零 LLM、零额度）。exclude 显式排除阿虎历史版与截图-CDP 旧版。",
+  "routes": [
+    {
+      "id": "shot-cdp",
+      "name": "截图-CDP.py（最新版）",
+      "path": "D:/wb/scripts/截图-CDP.py",
+      "runner": "python",
+      "match": ["截图", "屏幕截图", "截屏", "CDP截图"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "shot-window",
+      "name": "截图-窗口.py",
+      "path": "D:/wb/scripts/截图-窗口.py",
+      "runner": "python",
+      "match": ["窗口截图", "截窗口", "窗口抓图"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "look-screen",
+      "name": "看屏.py",
+      "path": "D:/wb/scripts/看屏.py",
+      "runner": "python",
+      "match": ["看屏", "看看屏幕", "屏幕内容", "识别屏幕"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "find-addressbar",
+      "name": "找地址栏.py",
+      "path": "D:/wb/scripts/找地址栏.py",
+      "runner": "python",
+      "match": ["找地址栏", "地址栏", "定位地址栏"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "export-history",
+      "name": "导出-会话历史.py",
+      "path": "D:/wb/scripts/导出-会话历史.py",
+      "runner": "python",
+      "match": ["导出会话历史", "会话历史", "导出历史", "导出聊天记录"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "update-board",
+      "name": "更新-进度看板.py",
+      "path": "D:/wb/scripts/更新-进度看板.py",
+      "runner": "python",
+      "match": ["更新进度看板", "进度看板", "看板更新", "更新看板"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "publish-version",
+      "name": "发布-版本化.js",
+      "path": "D:/wb/scripts/发布-版本化.js",
+      "runner": "node",
+      "match": ["发布版本", "版本化发布", "发布-版本化", "版本发布"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "mkpage",
+      "name": "download-page/mkpage.py",
+      "path": "D:/wb/scripts/download-page/mkpage.py",
+      "runner": "python",
+      "match": ["下载页面", "下载网页", "mkpage", "保存网页"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "settings-sync",
+      "name": "设定同步/sync.py",
+      "path": "D:/wb/scripts/设定同步/sync.py",
+      "runner": "python",
+      "match": ["设定同步", "同步设定", "设置同步", "配置同步"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    },
+    {
+      "id": "notify",
+      "name": "wb-notify 通知脚本（notify.py）",
+      "path": "D:/wb/scripts/notify/notify.py",
+      "runner": "python",
+      "match": ["通知", "发送通知", "提醒我", "发通知"],
+      "llm": false,
+      "output_dir_env": "PM_OUTPUT_DIR"
+    }
+  ],
+  "exclude": [
+    "阿虎-*",
+    "截图-CDP-v014~v027"
+  ]
+}

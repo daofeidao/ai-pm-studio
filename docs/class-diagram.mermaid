@@ -1,0 +1,234 @@
+classDiagram
+    class LoopPhase {
+        <<enumeration>>
+        IDLE
+        PLANNING
+        ASKING_WEB_AI
+        WAITING_RESPONSE
+        PARSING
+        DISPATCHING
+        PREPARING_WORKTREE
+        EXECUTING
+        REVIEWING_DIFF
+        MERGING
+        HUMAN_REVIEW
+        COLLECTING
+        FEEDING_BACK
+        PERSISTING
+        HANDING_OFF
+        DONE
+        PAUSED
+        FAILED
+    }
+    class AgentKind {
+        <<enumeration>>
+        script
+        workbuddy
+        opencode
+        dsh
+        openclaw
+        codebuddy
+    }
+    class CurrentState {
+        +str schema_version
+        +str project
+        +str status
+        +str phase
+        +int round
+        +int iteration
+        +str active_agent
+        +str|None task_id
+        +dict|None lock
+        +dict|None pending_approval
+        +str|None last_commit
+        +bool last_push_ok
+        +str updated_at
+    }
+    class PMStateView {
+        +dict loop
+        +dict quota
+        +dict board
+        +dict memory
+        +list approvals
+        +list capability_gaps
+        +list history
+        +derive_from(current, session_tail, reports, gitlog) PMStateView
+    }
+    class TaskSpec {
+        +str id
+        +str instruction
+        +bool irreversible
+        +str|None script_route
+        +list acceptance
+        +list allowed_paths
+    }
+    class AgentResult {
+        +str status
+        +str agent
+        +str summary
+        +list artifacts
+        +list irreversible_ops
+        +str|None error_code
+        +str|None error_detail
+        +str|None session_id
+        +int duration_ms
+    }
+    class QuotaInfo {
+        +str agent
+        +float max_percent
+        +dict windows
+        +str source
+        +str fetched_at
+        +bool stale
+    }
+    class ContextUsage {
+        +int chars_used
+        +int chars_limit
+    }
+    class WebAIReply {
+        +str text
+        +ContextUsage context_usage
+        +str|None raw_path
+    }
+    class MemoryPack {
+        +str goal
+        +list done
+        +list blocked
+        +str current_question
+        +str updated_at
+        +render() str
+    }
+    class Anchors {
+        +list decisions
+        +list constraints
+        +list preferences
+        +str progress
+    }
+    class ApprovalRequest {
+        +str id
+        +str op_type
+        +str command
+        +str requested_by
+        +str status
+        +str|None decision
+        +str|None decided_at
+    }
+    class HandoffDoc {
+        +str goal
+        +list constraints
+        +list key_files
+        +list todos
+        +list blockers
+        +str generated_at
+    }
+    class ReturnBlock {
+        +str ts
+        +str agent
+        +str did
+        +list changed_files
+        +str test_result
+        +str report_path
+        +str next_step
+        +str note
+    }
+    class AgentProvider {
+        <<abstract>>
+        +run(task: TaskSpec, handoff_path: Path) AgentResult
+        +check_quota() QuotaInfo
+        +capabilities() dict
+    }
+    class WorkBuddyProvider
+    class OpenCodeProvider
+    class MockOpenCodeProvider
+    class MockWorkBuddyProvider
+    class WebAIAdapter {
+        <<abstract>>
+        +send_prompt(prompt: str, memory_pack: str|None) WebAIReply
+        +get_context_usage() ContextUsage
+    }
+    class DeepSeekAdapter
+    class MockWebAIAdapter
+    class ChatGPTPlaceholderAdapter
+    class GitOps {
+        +is_repo() bool
+        +init_repo(remote: str|None, demo: bool) void
+        +ensure_state_branch() void
+        +read_current_json() dict|None
+        +write_current_json(state: dict, message: str) str
+        +stage_and_commit(paths: list[str], message: str) str
+        +push(branch: str, best_effort: bool) bool
+        +push_state(best_effort: bool) bool
+        +worktree_add(rel_path: str, branch: str, base: str) Path
+        +worktree_remove(rel_path: str, force: bool) void
+        +merge_task_branch(branch: str, message: str) dict
+        +diff_names(base: str, branch: str) list[str]
+        +status_paths(cwd_rel: str) list[str]
+        +fetch(refspec: str) bool
+        +head_sha(short: bool) str
+    }
+    class HandoffIO {
+        +render_handoff(ctx: HandoffContext) str
+        +write_handoff(content: str) void
+        +parse_handoff(text: str) HandoffDoc
+        +append_return(block: ReturnBlock) void
+        +read_last_return() ReturnBlock|None
+        +read_session_tail(n: int) list[ReturnBlock]
+        +build_task_odaf(handoff: HandoffDoc, last_return: ReturnBlock|None, current: dict) str
+        +write_task(content: str) void
+    }
+    class ScriptRouter {
+        +match(instruction: str) Route|None
+    }
+    class Dispatcher {
+        +dispatch(task: TaskSpec) AgentResult
+    }
+    class MemoryService {
+        +compress(transcript: str) MemoryPack
+        +should_inject(usage: ContextUsage) bool
+        +update_anchors(pack: MemoryPack) void
+        +render_pack(pack: MemoryPack) str
+    }
+    class CommandQueue {
+        +append(cmd: dict) void
+        +consume() list
+    }
+    class QuotaService {
+        +fetch(force: bool) QuotaInfo
+        -_from_stats_cli(project: str) QuotaInfo|None
+        -_from_usage_http() QuotaInfo|None
+    }
+    class CapabilityProbe {
+        +probe_all() dict
+    }
+    class Orchestrator {
+        +run(task: str, max_rounds: int) int
+        +resume() int
+        -_transition(to: LoopPhase) void
+        -_persist_git(message: str) void
+        -_derive_state_js() void
+        -_recover_lock() str
+        -_review_diff(task: TaskSpec) bool
+    }
+
+    AgentProvider <|-- WorkBuddyProvider
+    AgentProvider <|-- OpenCodeProvider
+    OpenCodeProvider <|-- MockOpenCodeProvider
+    WorkBuddyProvider <|-- MockWorkBuddyProvider
+    WebAIAdapter <|-- DeepSeekAdapter
+    WebAIAdapter <|-- MockWebAIAdapter
+    WebAIAdapter <|-- ChatGPTPlaceholderAdapter
+    Orchestrator --> GitOps : 读写分支/提交/推送
+    Orchestrator --> HandoffIO : 生成交接三件套
+    Orchestrator --> CurrentState : 唯一写者(经 GitOps)
+    Orchestrator --> PMStateView : 派生看板
+    Orchestrator --> MemoryService
+    Orchestrator --> CommandQueue
+    Orchestrator ..> WebAIAdapter : 经 ask-web-ai
+    Orchestrator --> CapabilityProbe
+    Dispatcher --> AgentProvider : 路由到
+    Dispatcher --> ScriptRouter : 脚本优先
+    Dispatcher --> QuotaService : 额度判定
+    Dispatcher --> GitOps : worktree 生命周期
+    MemoryService --> MemoryPack
+    MemoryService --> Anchors
+    Orchestrator --> ApprovalRequest : pending_approval

@@ -1,0 +1,78 @@
+{
+  "schema_version": "2.0",
+  "project": "pm-software",
+  "_comment": "全局配置。root 仅作文档记录，代码一律用 __file__ 推导的仓库根（支持 clone 到任意路径续跑）。",
+  "root": "C:/Users/Administrator/WorkBuddy/2026-10-20-11-29-05/pm-software",
+  "python": "C:/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe",
+  "node": "node",
+  "git": {
+    "exe": "git",
+    "remote": "",
+    "author_name": "pm-orchestrator",
+    "author_email": "pm@local",
+    "default_branch": "main",
+    "state_branch": "pm/state"
+  },
+  "paths": {
+    "handoff": "HANDOFF.md",
+    "session": "SESSION.md",
+    "task": "TASK.md",
+    "worktrees_dir": "worktrees",
+    "work_dir": "work",
+    "reports_dir": "reports",
+    "memory_dir": "memory",
+    "transcripts_dir": "memory/transcripts",
+    "anchors": "memory/anchors.json",
+    "queue": "commands/queue.jsonl",
+    "dashboard_dir": "dashboard",
+    "state_js": "dashboard/state.js",
+    "capabilities": "capabilities.json",
+    "script_index": "script-index.json"
+  },
+  "opencode": {
+    "exe": "C:/Users/Administrator/AppData/Local/Programs/@opencodedesktop/resources/opencode-cli.exe",
+    "model": "",
+    "timeout_s": 1800,
+    "stats_days": 30,
+    "monthly_budget_usd": 0
+  },
+  "quota": {
+    "usage_url": "https://opencode.ai/zen/go/v1/usage",
+    "cache_s": 60,
+    "degrade_percent": 90,
+    "demo_quota_percent": 22
+  },
+  "memory": {
+    "threshold_chars": 24000,
+    "limit_chars": 120000,
+    "max_pack_items": 5
+  },
+  "loop": {
+    "max_rounds": 10,
+    "max_rework": 2,
+    "reject_action": "handover"
+  },
+  "web_ai": {
+    "provider": "deepseek",
+    "chat_url": "https://chat.deepseek.com",
+    "cdp_py": "C:/Users/Administrator/.workbuddy/skills/browser-automation-cdp/scripts/cdp.py",
+    "timeout_s": 120,
+    "poll_s": 3
+  },
+  "dashboard": {
+    "refresh_s": 2
+  },
+  "approval": {
+    "queue": "commands/queue.jsonl"
+  },
+  "demo": {
+    "enabled": false,
+    "remote_dir": ".demo-remote",
+    "bare_name": "pm-software.git"
+  },
+  "capability_probe": {
+    "dsh": { "enabled": null },
+    "openclaw": { "enabled": null },
+    "codebuddy": { "enabled": null }
+  }
+}

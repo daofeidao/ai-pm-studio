@@ -1,0 +1,25 @@
+sequenceDiagram
+    actor U as 用户（新机器）
+    participant O as Orchestrator resume
+    participant G as GitOps
+    participant CJ as pm/state:current.json
+    participant S as SESSION.md
+    participant HI as HandoffIO
+
+    U->>G: git clone <remote>（main 全量 + pm/state 引用）
+    U->>G: fetch origin pm/state
+    U->>CJ: read_current_json()
+    alt lock=held 且 worktree 不存在
+        O->>O: 判崩溃残留 → 清锁 → 该 task 重派
+    else lock=held 且 worktree 存在
+        O->>G: 检查 task 分支是否已有 commit
+        alt 有 commit
+            O->>O: 直接进 REVIEWING_DIFF
+        else
+            O->>G: worktree_remove → 重派
+        end
+    end
+    O->>S: read_last_return()
+    O->>HI: build_task_odaf(parse_handoff(HANDOFF.md), last_return, current)
+    HI-->>O: TASK.md
+    O->>O: 从 current.phase 续跑（OpenCode 不用 --continue，以 TASK.md 冷启动）

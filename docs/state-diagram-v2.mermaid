@@ -1,0 +1,33 @@
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> PLANNING: run(task) / resume()
+    PLANNING --> ASKING_WEB_AI
+    ASKING_WEB_AI --> WAITING_RESPONSE
+    WAITING_RESPONSE --> PARSING: 收到回答
+    WAITING_RESPONSE --> FAILED: E_WEB_AI_TIMEOUT
+    PARSING --> DISPATCHING: 解析出动作清单
+    PARSING --> PERSISTING: 无需派活(仅汇报)
+    DISPATCHING --> PREPARING_WORKTREE: 路由确定 script/WB/OC
+    DISPATCHING --> FAILED: E_SCRIPT_NOT_FOUND
+    PREPARING_WORKTREE --> EXECUTING: worktree_add 成功
+    PREPARING_WORKTREE --> FAILED: E_GIT_WORKTREE_FAILED
+    EXECUTING --> HUMAN_REVIEW: 检测到不可逆操作
+    EXECUTING --> REVIEWING_DIFF: AgentResult 回收
+    HUMAN_REVIEW --> EXECUTING: 批准
+    HUMAN_REVIEW --> PAUSED: 否决(handover 转人工)
+    REVIEWING_DIFF --> MERGING: 验收通过
+    REVIEWING_DIFF --> EXECUTING: 打回重做(≤max_rework)
+    REVIEWING_DIFF --> FAILED: E_DIFF_REJECTED
+    MERGING --> COLLECTING: merge 成功
+    MERGING --> HANDING_OFF: E_MERGE_CONFLICT(转人工)
+    COLLECTING --> FEEDING_BACK
+    FEEDING_BACK --> ASKING_WEB_AI: 未完成且 round<max_rounds
+    FEEDING_BACK --> PERSISTING: 完成或达 max_rounds
+    PERSISTING --> HANDING_OFF: commit+push 完成
+    HANDING_OFF --> DONE
+    HANDING_OFF --> IDLE: 交接待续(跨机/下轮)
+    PLANNING --> PAUSED: 暂停指令
+    EXECUTING --> PAUSED: 暂停指令
+    DONE --> [*]
+    PAUSED --> [*]
+    FAILED --> [*]

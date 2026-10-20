@@ -1,0 +1,31 @@
+sequenceDiagram
+    participant O as Orchestrator
+    participant M as pm-memory(memory.py)
+    participant Q as CommandQueue(commands/queue.jsonl)
+    participant CJ as pm/state:current.json
+    participant U as 用户
+
+    loop round = 1 .. max_rounds
+        O->>M: should_inject(usage)
+        alt usage_chars ≥ threshold_chars
+            M->>M: 规则压缩 → anchors.json
+            M-->>O: MemoryPack（固定格式，随提问注入）
+        else 未超阈值
+            M-->>O: null（不注入）
+        end
+        O->>O: ASKING_WEB_AI → PARSING → DISPATCHING → EXECUTING
+        alt AgentResult.irreversible_ops 非空
+            O->>CJ: HUMAN_REVIEW + pending_approval
+            O->>U: 看板待审批红标
+            U->>Q: append {"cmd":"approve"/"reject","id":"apr-0007"}
+            O->>Q: consume()
+            alt 批准
+                O->>O: 编排器执行不可逆操作（OpenCode 不直接做）
+            else 否决（默认 handover）
+                O->>CJ: PAUSED（转人工，可 resume）
+            end
+        end
+        O->>O: REVIEWING_DIFF → MERGING → PERSISTING（commit+push+交接）
+        O->>CJ: 未完成 → FEEDING_BACK → 下一轮
+    end
+    O->>CJ: DONE

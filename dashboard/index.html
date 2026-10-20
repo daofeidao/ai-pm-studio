@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="2">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>项目经理编排器 · 看板</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --line: #26304a; --txt: #dbe4f5;
+    --dim: #8b98b8; --ok: #37c871; --warn: #f5a623; --bad: #f25c5c; --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--txt);
+         font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif; }
+  header { display: flex; align-items: center; gap: 1rem; padding: .6rem 1rem;
+           border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; }
+  .pill { padding: .1rem .6rem; border-radius: 999px; border: 1px solid var(--line);
+          color: var(--dim); font-size: 12px; }
+  .pill.run { color: var(--ok); border-color: var(--ok); }
+  .pill.paused { color: var(--warn); border-color: var(--warn); }
+  .pill.failed { color: var(--bad); border-color: var(--bad); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; padding: .75rem 1rem 2rem; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .75rem 1rem; }
+  section h2 { font-size: 13px; color: var(--dim); margin: 0 0 .5rem;
+               text-transform: uppercase; letter-spacing: .05em; }
+  .kv { display: grid; grid-template-columns: 6rem 1fr; gap: .2rem .6rem; }
+  .kv dt { color: var(--dim); } .kv dd { margin: 0; }
+  .bar { height: 8px; background: #0a0e18; border-radius: 4px; overflow: hidden; margin: .2rem 0 .5rem; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .bar.warn > i { background: var(--warn); }
+  .cols { display: grid; grid-template-columns: repeat(5, 1fr); gap: .5rem; }
+  .col { background: #0d1322; border: 1px solid var(--line); border-radius: 6px;
+         padding: .5rem; min-height: 4.5rem; }
+  .col h3 { margin: 0 0 .35rem; font-size: 12px; color: var(--dim); }
+  .col ul { margin: 0; padding-left: 1.1rem; }
+  .col.approval { border-color: var(--bad); }
+  .col.approval h3 { color: var(--bad); }
+  .anchors dt { color: var(--dim); } .anchors dd { margin: 0 0 .3rem; }
+  .approval-item { border: 1px solid var(--bad); border-radius: 6px; padding: .5rem .6rem; }
+  .approval-item code { color: var(--warn); }
+  .history { margin: 0; padding-left: 1.2rem; color: var(--dim); font-family: Consolas, monospace;
+             font-size: 12px; max-height: 8rem; overflow: auto; }
+  #degraded { grid-column: 1 / -1; text-align: center; color: var(--warn);
+              border: 1px dashed var(--warn); border-radius: 8px; padding: 3rem 1rem; }
+  footer { padding: .5rem 1rem; color: var(--dim); font-size: 12px;
+           border-top: 1px solid var(--line); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>项目经理编排器 v0.1</h1>
+  <span class="pill" id="status-pill">…</span>
+  <span class="pill">内存 2.1/2.68GB</span>
+  <span class="pill">代理 1/1</span>
+  <span class="pill" id="updated-pill"></span>
+</header>
+<main>
+  <div id="degraded" hidden>等待编排器首次运行（未找到 dashboard/state.js 或 window.PM_STATE 为空）<br>
+  执行：python .workbuddy/skills/pm-orchestrator/orchestrator.py init --demo</div>
+
+  <section id="sec-loop">
+    <h2>循环状态 Loop State</h2>
+    <dl class="kv" id="loop-kv"></dl>
+  </section>
+
+  <section id="sec-quota">
+    <h2>代理额度 Quota</h2>
+    <div id="quota-body"></div>
+  </section>
+
+  <section id="sec-board" style="grid-column: 1 / -1;">
+    <h2>项目看板 Board</h2>
+    <div class="cols" id="board-cols"></div>
+  </section>
+
+  <section id="sec-memory">
+    <h2>记忆窗口 Memory</h2>
+    <dl class="kv anchors" id="memory-kv"></dl>
+  </section>
+
+  <section id="sec-approval">
+    <h2>人工审批 Approval</h2>
+    <div id="approval-body"></div>
+  </section>
+
+  <section id="sec-history" style="grid-column: 1 / -1;">
+    <h2>最近提交 History（git log main）</h2>
+    <ul class="history" id="history-list"></ul>
+  </section>
+</main>
+<footer>看板只读 · 不发起任何写操作 · 审批/指令请追加到 commands/queue.jsonl（NDJSON）</footer>
+
+<script src="state.js"></script>
+<script>
+(function () {
+  "use strict";
+  var S = window.PM_STATE;
+  if (!S || !S.loop) {
+    document.getElementById("degraded").hidden = false;
+    ["sec-loop", "sec-quota", "sec-board", "sec-memory", "sec-approval", "sec-history"]
+      .forEach(function (id) { document.getElementById(id).style.display = "none"; });
+    return;
+  }
+  document.getElementById("degraded").remove();
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function kv(container, rows) {
+    container.innerHTML = "";
+    rows.forEach(function (r) {
+      var dt = el("dt", null, r[0]); var dd = el("dd", null, r[1]);
+      container.appendChild(dt); container.appendChild(dd);
+    });
+  }
+  function pct(v) { return Math.round((v || 0) * 100) / 100; }
+
+  // ---- 头部状态 ----
+  var status = (S.loop.status || "UNKNOWN").toUpperCase();
+  var pill = document.getElementById("status-pill");
+  pill.textContent = "状态:" + status;
+  pill.classList.add(status === "RUNNING" ? "run" : status === "PAUSED" ? "paused" : status === "FAILED" ? "failed" : "");
+  document.getElementById("updated-pill").textContent =
+    S.loop.updated_at ? "更新于 " + S.loop.updated_at : "";
+
+  // ---- 循环状态 ----
+  kv(document.getElementById("loop-kv"), [
+    ["轮次", (S.loop.round || 0) + " / " + (S.loop.max_rounds || "?")],
+    ["阶段", S.loop.phase || "-"],
+    ["当前代理", S.loop.active_agent || "-"],
+    ["当前任务", S.loop.task_id || "-"],
+    ["目标", S.loop.goal || "-"]
+  ]);
+
+  // ---- 额度 ----
+  var qb = document.getElementById("quota-body");
+  qb.innerHTML = "";
+  var oc = (S.quota && S.quota.opencode) || {};
+  qb.appendChild(el("div", null, "OpenCode（max_percent=" + pct(oc.max_percent) +
+    (oc.stale ? "，stale 不拦截" : "") + "）"));
+  var bar = el("div", "bar" + (pct(oc.max_percent) > 90 ? " warn" : ""));
+  bar.appendChild(el("i"));
+  bar.firstChild.style.width = Math.min(100, pct(oc.max_percent)) + "%";
+  qb.appendChild(bar);
+  if (oc.windows) {
+    var w = oc.windows, wl = [];
+    Object.keys(w).forEach(function (k) { wl.push(k + ": " + pct(w[k]) + "%"); });
+    if (wl.length) qb.appendChild(el("div", null, wl.join(" · "))));
+  }
+  qb.appendChild(el("div", null, "WorkBuddy：" +
+    ((S.quota && S.quota.workbuddy && S.quota.workbuddy.note) || "同进程执行，无外部额度")));
+
+  // ---- 看板五列 ----
+  var board = S.board || {};
+  var cols = [
+    ["待办", board.todo || []], ["提问中", board.asking || []],
+    ["执行中", board.executing || []], ["待审批", board.approval || []], ["完成", board.done || []]
+  ];
+  var bc = document.getElementById("board-cols");
+  bc.innerHTML = "";
+  cols.forEach(function (c) {
+    var col = el("div", "col" + (c[0] === "待审批" ? " approval" : ""));
+    col.appendChild(el("h3", null, c[0]));
+    var ul = el("ul");
+    if (!c[1].length) ul.appendChild(el("li", null, "（空）"));
+    c[1].forEach(function (it) { ul.appendChild(el("li", null, it)); });
+    col.appendChild(ul);
+    bc.appendChild(col);
+  });
+
+  // ---- 记忆 ----
+  var mem = S.memory || {}, an = mem.anchors || {};
+  kv(document.getElementById("memory-kv"), [
+    ["阈值", (mem.threshold_chars || 0) + " 字符"],
+    ["当前用量", (mem.usage_chars || 0) + " 字符"],
+    ["最近注入", mem.last_injected_at || "未注入"],
+    ["决策", (an.decisions || []).join("；") || "无"],
+    ["约束", (an.constraints || []).join("；") || "无"],
+    ["偏好", (an.preferences || []).join("；") || "无"],
+    ["进度", an.progress || "无"]
+  ]);
+
+  // ---- 审批 ----
+  var ab = document.getElementById("approval-body");
+  ab.innerHTML = "";
+  var aps = S.approvals || [];
+  if (!aps.length) {
+    ab.appendChild(el("div", null, "暂无待审批项"));
+  } else {
+    aps.forEach(function (a) {
+      var box = el("div", "approval-item");
+      box.appendChild(el("div", null, "⚠ " + (a.op_type || "?") + "（不可逆）"));
+      box.appendChild(el("code", null, a.command || ""));
+      box.appendChild(el("div", null,
+        "请求方：" + (a.requested_by || "-") + " · 于 " + (a.requested_at || a.decided_at || "-") +
+        " · 状态：" + (a.status || "pending")));
+      box.appendChild(el("div", null,
+        "批准：commands/queue.jsonl 追加 {\"cmd\":\"approve\",\"id\":\"" + (a.id || "") + "\"}"));
+      ab.appendChild(box);
+    });
+  }
+
+  // ---- 历史 ----
+  var hl = document.getElementById("history-list");
+  hl.innerHTML = "";
+  var hist = S.history || [];
+  if (!hist.length) hl.appendChild(el("li", null, "（无提交历史）"));
+  hist.forEach(function (h) { hl.appendChild(el("li", null, h)); });
+})();
+</script>
+</body>
+</html>

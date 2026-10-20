@@ -1,0 +1,6 @@
+dashboard/state.js
+worktrees/
+*.tmp
+__pycache__/
+.demo-remote/
+.DS_Store

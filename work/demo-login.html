@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>演示登录页</title>
+</head>
+<body>
+  <h1>演示登录页（pm-orchestrator demo 产物）</h1>
+  <form id="login-form" action="/login" method="post">
+    <label>用户名 <input type="text" name="username" required></label>
+    <label>密码 <input type="password" name="password" required minlength="6"></label>
+    <button type="submit">登录</button>
+  </form>
+  <script>
+    // demo：基础前端校验（非空 + 密码长度）
+    document.getElementById('login-form').addEventListener('submit', function (e) {
+      var u = this.username.value.trim();
+      var p = this.password.value;
+      if (!u || p.length < 6) { e.preventDefault(); alert('请填写用户名且密码至少 6 位'); }
+    });
+  </script>
+</body>
+</html>

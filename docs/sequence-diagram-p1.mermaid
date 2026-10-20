@@ -1,0 +1,57 @@
+sequenceDiagram
+    actor U as 用户
+    participant O as Orchestrator(orchestrator.py)
+    participant G as GitOps(git_ops.py)
+    participant CJ as pm/state:current.json
+    participant W as ask-web-ai(web_ai.py)
+    participant DS as DeepSeek 网页(CDP/Edge)
+    participant DI as dispatch-agent(dispatcher.py)
+    participant Q as QuotaService
+    participant WT as worktrees/task-<id>
+    participant OC as OpenCodeProvider
+    participant HI as HandoffIO
+    participant DB as dashboard/state.js
+
+    U->>O: run "实现登录页" [--demo]
+    O->>G: fetch_state() + read_current_json()
+    O->>CJ: PLANNING（commit pm/state）
+    O->>W: ASKING_WEB_AI(prompt + MemoryPack?)
+    W->>DS: CDP 五步（探测/导航/输入/等待/抽取）
+    DS-->>W: 回答文本
+    W-->>O: WebAIReply
+    O->>CJ: PARSING（解析动作清单+验收标准）
+    O->>DI: DISPATCHING(TaskSpec)
+    DI->>DI: ScriptRouter.match(instruction)
+    alt 命中 script-index（零 LLM）
+        DI->>G: worktree_add(worktrees/task-014, -b task-014)
+        DI->>WT: 执行脚本（cwd=worktree）
+    else 未命中
+        DI->>Q: check_quota()
+        Q-->>DI: QuotaInfo(max_percent)
+        alt max_percent > 90
+            DI->>DI: 降级 WorkBuddyProvider（同进程直写 main 的 work/）
+        else 额度正常
+            DI->>G: worktree_add(worktrees/task-014, -b task-014)
+            DI->>OC: run(--format json --auto -f HANDOFF.md "<msg>" <wt>)
+            OC->>WT: opencode run（跑完退出）
+            WT-->>OC: --format json 输出
+            OC-->>DI: AgentResult(+session_id)
+        end
+    end
+    DI-->>O: AgentResult
+    O->>G: diff_names(main...task-014) 或 status_paths(main)
+    O->>CJ: REVIEWING_DIFF
+    alt 验收通过（改动∈allowed_paths 且满足 acceptance）
+        O->>G: merge --no-ff task-014
+        O->>G: worktree_remove + branch -d
+        O->>CJ: MERGING→COLLECTING→FEEDING_BACK
+        O->>G: commit main（reports/, SESSION.md, HANDOFF.md）
+        O->>G: push（best-effort，失败记 last_push_ok=false）
+        O->>CJ: PERSISTING（current.json commit+push）
+        O->>HI: append_return(SESSION.md)
+        O->>DB: 派生 state.js（current.json+SESSION+reports）
+        O->>CJ: HANDING_OFF→DONE
+    else 验收失败
+        O->>OC: 携带 diff 反馈重做（≤max_rework=2）
+    end
+    O-->>U: exit 0；看板与仓库可见全部产物
