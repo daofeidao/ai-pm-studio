@@ -27,27 +27,48 @@
     {
       "agent": "dsh",
       "reason": "探测接口未确认（enabled=null，不阻塞主流程）",
-      "at": "2026-10-20T05:56:07Z"
+      "at": "2026-10-20T07:34:58Z"
     },
     {
       "agent": "openclaw",
       "reason": "探测接口未确认（enabled=null，不阻塞主流程）",
-      "at": "2026-10-20T05:56:07Z"
+      "at": "2026-10-20T07:34:58Z"
     },
     {
       "agent": "codebuddy",
       "reason": "探测接口未确认（enabled=null，不阻塞主流程）",
-      "at": "2026-10-20T05:56:07Z"
+      "at": "2026-10-20T07:34:58Z"
+    },
+    {
+      "agent": "reverse_toolchain",
+      "reason": "缺失工具: asar, jadx, apktool, otool, nm, go, rg, ghidra（降级通用 OpenCode）",
+      "at": "2026-10-20T07:34:59Z"
     }
   ],
   "reverse_toolchain": {
-    "asar": { "present": false },
-    "jadx": { "present": false },
-    "apktool": { "present": false },
-    "otool": { "present": false },
-    "nm": { "present": false },
-    "go": { "present": false },
-    "rg": { "present": false },
-    "ghidra": { "present": false }
+    "asar": {
+      "present": false
+    },
+    "jadx": {
+      "present": false
+    },
+    "apktool": {
+      "present": false
+    },
+    "otool": {
+      "present": false
+    },
+    "nm": {
+      "present": false
+    },
+    "go": {
+      "present": false
+    },
+    "rg": {
+      "present": false
+    },
+    "ghidra": {
+      "present": false
+    }
   }
 }
