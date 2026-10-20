@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,22 @@ SCENARIOS = ("happy", "circuit", "degrade", "selector")
 # ---------------------------------------------------------------------------
 # 基础工具
 # ---------------------------------------------------------------------------
+
+def force_rmtree(path: Path) -> None:
+    """删除沙箱：Windows 上 `.git/objects` 是只读，普通 rmtree 会静默留垃圾。"""
+    def _on_error(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+
+    if not path.exists():
+        return
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_on_error)
+    else:  # pragma: no cover —— 兼容 3.11 及更早
+        shutil.rmtree(path, onerror=_on_error)
 
 def load_cfg() -> dict:
     return json.loads((ROOT / "pm.config.json").read_text(encoding="utf-8"))
@@ -263,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         total_failed += checklist.failed
         results.append((name, checklist, sandbox, ""))
         if not args.keep:
-            shutil.rmtree(sandbox, ignore_errors=True)
+            force_rmtree(sandbox)
 
     print("\n=== 汇总 ===")
     for name, checklist, sandbox, _ in results:

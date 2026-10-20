@@ -58,3 +58,10 @@
 - 报告路径：reports/qa-demo-20261020T185311.md
 - 建议下一步：按序接 LeanREA 逆向路由 → 17 态审查表落地 → Magpie 真实网关联调（在线环境）。
 - 备注：blocked_external —— Magpie 真实网关与真实 `opencode run --format json` 采样需在线，`reports/t5/sample-result.json` 记录本次采样超时（3 分钟 kill）；遗留 —— 主仓库仍有 `worktrees/task-001` 与分支 `task-001`（已 gitignore，未清理）。
+## ↪ Return · 2026-10-20T10:55:19Z · pm-orchestrator(QA)
+- 做了什么：补修 QA 沙箱清理 —— Windows 上 `.git/objects` 只读导致 `shutil.rmtree(ignore_errors=True)` 静默失败，`%TEMP%` 残留 15 个 `pm-qa-*` 沙箱；新增 `force_rmtree()`（chmod +w 后重试，3.12+ 用 `onexc`）并清空存量。
+- 改动文件：tools/run_demo_qa.py
+- 测试结果：`--scenario selector` 复跑 9/9 通过，跑完 `%TEMP%\pm-qa-*` 为空（清理生效）。
+- 报告路径：reports/qa-demo-20261020T185311.md
+- 建议下一步：同前一条（LeanREA → 17 态 → Magpie 联调）。
+- 备注：仅影响本地临时目录，不改断言与业务逻辑。
