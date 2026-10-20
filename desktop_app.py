@@ -129,7 +129,7 @@ class Api:
             with open(script_path, 'w', encoding='utf-8') as f:
                 f.write(code)
             
-            result = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=30, cwd=work_dir)
+            result = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=30, cwd=work_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
             
             update_state("DONE", "执行完成！", code + "\n\n=== 运行结果 ===\n" + output)

@@ -266,6 +266,9 @@ def run_cli(
     full_env = os.environ.copy()
     if env:
         full_env.update({str(k): str(v) for k, v in env.items()})
+    # 无窗口子进程：GUI 壳（pywebview / PyInstaller --noconsole）里每次调用 CLI
+    # 都会闪出一个黑色控制台窗口；轮询式调用（等 AI 回答）会连闪几十次。
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     try:
         proc = subprocess.Popen(
             [str(a) for a in argv],
@@ -276,6 +279,7 @@ def run_cli(
             encoding="utf-8",
             errors="replace",
             env=full_env,
+            creationflags=flags,
         )
     except FileNotFoundError as e:
         raise PMError(E_SCRIPT_NOT_FOUND, f"可执行文件不存在: {argv[0]} ({e})") from e
