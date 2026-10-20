@@ -33,6 +33,8 @@ def cmd_ask(question: str, demo: bool, provider: str | None = None) -> int:
     except PMError as e:
         print(f"[PM] ask 失败: {e}")
         return e.code
+    for line in getattr(adapter, "preflight_log", []):
+        print(line)
     usage = reply.context_usage
     if usage is not None:
         print(f"[context] chars_used={usage.chars_used}/{usage.chars_limit}")
@@ -62,11 +64,17 @@ def _selftest() -> int:
     # 2) 真实路径 dry-run：五步命令清单可构造（不执行，不启浏览器）
     ds = wa.DeepSeekAdapter(ROOT, cfg)
     steps = ds.build_steps("你好")
-    checks.append(("DeepSeek 五步命令清单非空", len(steps) == 6 and steps[0] == ["status"]))
+    checks.append(("DeepSeek 五步命令清单非空", len(steps) == 6 and steps[0] == ["eval", "1+1"]))
     checks.append(
         (
             "DeepSeek 常量区齐全",
             bool(ds.CHAT_URL) and bool(ds.INPUT_SELECTOR) and bool(ds.ANSWER_CONTAINER_SELECTOR),
+        )
+    )
+    checks.append(
+        (
+            "Edge 自愈参数齐全（端口/Profile/超时）",
+            ds.debug_port == 9222 and bool(ds.edge_profile) and ds.restart_timeout_s > 0,
         )
     )
 

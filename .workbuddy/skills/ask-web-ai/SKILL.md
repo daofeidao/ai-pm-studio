@@ -22,7 +22,7 @@ Python 解释器固定 managed 3.13.12（`pm.config.json` 的 `python` 字段）
 
 | 步 | cdp.py 子命令 | 失败错误码 |
 |----|--------------|-----------|
-| ① 探测 | `status` | 不可达 → `E_CDP_UNREACHABLE=32`（提示启动调试 Edge） |
+| ① 前置检查 | `eval 1+1`（WS 探活）；不可达或握手 403 → 自动重启 Edge 并等待就绪 | 重启后仍不可达 → `E_CDP_UNREACHABLE=32` |
 | ② 导航 | `open https://chat.deepseek.com` | 落登录页 → `E_WEB_AI_NOT_LOGGED_IN=31` |
 | ③ 输入提交 | `type <输入框> <问题>` → `click <发送钮>`；点不动则派发 Enter 兜底 | — |
 | ④ 轮询等待 | `eval` 统计回答容器数，超过发送前基线才收 | 超时 → `E_WEB_AI_TIMEOUT=30` |
@@ -35,24 +35,36 @@ Python 解释器固定 managed 3.13.12（`pm.config.json` 的 `python` 字段）
 
 | 项 | 实测值 | 备注 |
 |----|--------|------|
-| 输入框 | `textarea[placeholder*='发送消息']` | `id` 为空；旧的 `textarea#chat-input` 不存在 |
+| 输入框 | `textarea[placeholder*='发送消息']` | 页面 `id` 为空，靠 placeholder 定位 |
 | 发送钮 | `div.bf38813a div[role=button]` | 不是 `<button>`，无 `aria-label`；点击无效时回车兜底 |
 | 回答容器 | `div.ds-message div.ds-markdown` | 必须排除思考块 `ds-think-content`，否则会把推理过程当回答 |
 | 页面全文本 | 不可用于取答 | 侧边栏历史会话会被一起抓进来，须按容器抽取 |
 
-### 启动参数（踩过）
+### 调试 Edge 前置检查与自动重启（v2.2）
 
-必须带 `--remote-allow-origins=*`：
+`DeepSeekAdapter.send_prompt` 第 ① 步先跑 `ensure_ready()`：
 
-```powershell
-& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" `
-  --remote-debugging-port=9222 --remote-allow-origins=* `
-  --user-data-dir=C:\temp\edge-pm https://chat.deepseek.com
-```
+1. 用 `cdp.py eval 1+1` 做 **WS 层**探活。`cdp.py status` 只查 HTTP，
+   握手 403 时仍会报 `CDP_OK`，不能作为可用性依据。
+2. 探活失败（**不可达**或**握手被 403**）且 `web_ai.auto_restart=true`：
+   - 只杀带 `--remote-debugging-port=9222` 的 msedge（不动日常浏览器窗口）；
+   - 以固定参数重启：`--remote-debugging-port=<port> --remote-allow-origins=* --user-data-dir=<profile> <chat_url>`；
+   - 每秒重新探活，直到 `restart_timeout_s`（默认 40s）；超时抛 `E_CDP_UNREACHABLE`。
 
-`cdp.py` 的 WebSocket 握手会带 `Origin: http://127.0.0.1:9222`，
-Edge 111+ 默认拒绝（握手 403），表现为「status 正常但 type/click/wait 全部无效果」，
-最终只会看到 `E_WEB_AI_TIMEOUT`。加上该参数后 403 消失。
+参数全部在 `pm.config.json` 的 `web_ai` 下：
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `debug_port` | `9222` | CDP 端口 |
+| `edge_exe` | 自动探测两处 Program Files | msedge.exe 路径 |
+| `edge_profile` | `C:\temp\edge-pm` | 专用 Profile（登录态持久化在这里） |
+| `auto_restart` | `true` | 关掉则失败即报错，不自动重启 |
+| `restart_timeout_s` | `40` | 重启后等待就绪的上限 |
+
+登录态保存在专用 Profile 中，重启不会掉登录；**首次仍需人工登录一次**。
+`cdp.py` 的握手固定带 `Origin: http://127.0.0.1:9222`，Edge 111+ 默认拒绝（403），
+所以 `--remote-allow-origins=*` 不是可选项 —— 缺失时症状是「status 正常但
+type/click/wait 全部空转，最终只报 `E_WEB_AI_TIMEOUT`」。
 
 ## 写死纪律（违反即返工）
 

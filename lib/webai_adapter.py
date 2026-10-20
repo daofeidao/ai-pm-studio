@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -54,6 +56,14 @@ DEEPSEEK_SELECTORS: dict[str, str] = {
 
 #: 兜底后端模块名（缺失选择器时尝试 import；提供 aiAct 动作）
 DRISSIONPAGE_AI_MODULE = "drissionpage_ai"
+
+#: 调试 Edge 的默认启动参数（缺 `--remote-allow-origins=*` 时 cdp.py 握手 403）
+DEFAULT_EDGE_EXE_CANDIDATES: tuple[str, ...] = (
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+)
+DEFAULT_EDGE_PROFILE = r"C:\temp\edge-pm"
+DEFAULT_DEBUG_PORT = 9222
 
 #: 兜底后端提供的动作名（drissionpage-ai 的 AI 辅助点击/输入）
 DRISSIONPAGE_AI_ACTION = "aiAct"
@@ -176,6 +186,14 @@ class DeepSeekAdapter(WebAIAdapter):
         self.chat_url: str = wa.get("chat_url", self.CHAT_URL)
         self.timeout_s: int = int(wa.get("timeout_s", self.TIMEOUT_S))
         self.poll_s: float = float(wa.get("poll_s", self.POLL_S))
+        # 调试 Edge 自愈参数（v2.2）：WS 403 / 不可达时自动重启实例
+        self.debug_port: int = int(wa.get("debug_port", DEFAULT_DEBUG_PORT))
+        self.edge_exe: str = str(wa.get("edge_exe", "") or "").strip()
+        self.edge_profile: str = str(wa.get("edge_profile", DEFAULT_EDGE_PROFILE))
+        self.auto_restart: bool = bool(wa.get("auto_restart", True))
+        self.restart_timeout_s: int = int(wa.get("restart_timeout_s", 40))
+        #: 前置检查过程日志（供 CLI/E2E 展示）
+        self.preflight_log: list[str] = []
         # 主路径选择器：常量区默认值 + 配置覆盖（配置可置空以演练兜底/缺失）
         configured = wa.get("selectors")
         self.selectors: dict[str, str] = dict(DEEPSEEK_SELECTORS)
@@ -189,7 +207,7 @@ class DeepSeekAdapter(WebAIAdapter):
     def _cdp(self, args: list[str], timeout_s: float | None = None):
         """调用 cdp.py 子命令；CDP 不可达（rc=2）映射 E_CDP_UNREACHABLE。"""
         proc = run_cli(
-            [self.python, self.cdp_py] + args,
+            [self.python, self.cdp_py, "--port", str(self.debug_port)] + args,
             cwd=self.root,
             timeout_s=timeout_s or 60,
         )
@@ -244,6 +262,98 @@ class DeepSeekAdapter(WebAIAdapter):
         )
         self._eval(js)
 
+    # ---- 前置检查：WS 探活 + 403 自愈（v2.2） ----
+
+    def _ws_probe(self) -> tuple[bool, str]:
+        """用 WS 通道探活。
+
+        注意：`cdp.py status` 只查 HTTP 接口，握手被 403 时它**仍报 CDP_OK**，
+        所以探活必须走真正的 WS 调用（eval）。
+        """
+        try:
+            proc = self._cdp(["eval", "1+1"], timeout_s=20)
+        except PMError as e:
+            return False, str(e)
+        except pm_common.CliTimeout:
+            return False, "WS 探活超时"
+        out = ((proc.stdout or "") + " " + (proc.stderr or "")).strip()
+        if proc.returncode == 0 and (proc.stdout or "").strip() == "2":
+            return True, "ok"
+        return False, out
+
+    def _resolve_edge_exe(self) -> str:
+        """按配置/候选路径定位 msedge.exe。"""
+        if self.edge_exe and Path(self.edge_exe).exists():
+            return self.edge_exe
+        for cand in DEFAULT_EDGE_EXE_CANDIDATES:
+            if Path(cand).exists():
+                return cand
+        raise PMError(E_CDP_UNREACHABLE, "找不到 msedge.exe，无法自动重启调试实例")
+
+    def _kill_debug_edge(self) -> int:
+        """只杀带调试端口的 msedge，不动用户日常浏览器窗口。"""
+        ps = (
+            "Get-CimInstance Win32_Process -Filter \"Name = 'msedge.exe'\" | "
+            "Where-Object { $_.CommandLine -like '*--remote-debugging-port=%d*' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"
+        ) % self.debug_port
+        proc = run_cli(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            timeout_s=30,
+        )
+        return len([ln for ln in (proc.stdout or "").splitlines() if ln.strip().isdigit()])
+
+    def _launch_edge(self) -> None:
+        """以固定参数重启调试 Edge（必带 --remote-allow-origins=*）。"""
+        exe = self._resolve_edge_exe()
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "DETACHED_PROCESS", 0
+        )
+        subprocess.Popen(
+            [
+                exe,
+                f"--remote-debugging-port={self.debug_port}",
+                "--remote-allow-origins=*",
+                f"--user-data-dir={self.edge_profile}",
+                self.chat_url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+
+    def ensure_ready(self) -> list[str]:
+        """前置检查：CDP 不可达或 WS 握手 403 → 自动重启调试 Edge 并等待就绪。
+
+        返回过程日志（同时存入 self.preflight_log）。
+        """
+        log: list[str] = []
+        self.preflight_log = log
+        ok, detail = self._ws_probe()
+        if ok:
+            log.append(f"[preflight] CDP 可用（WS 探活 OK，port={self.debug_port}）")
+            return log
+        log.append(f"[preflight] CDP 不可用或握手被拒：{detail[:300]}")
+        if not self.auto_restart:
+            raise PMError(E_CDP_UNREACHABLE, f"CDP 不可用且 auto_restart=false：{detail[:200]}")
+        killed = self._kill_debug_edge()
+        log.append(f"[preflight] 已停止旧调试实例 {killed} 个进程")
+        self._launch_edge()
+        log.append(
+            f"[preflight] 已启动 Edge：--remote-debugging-port={self.debug_port} "
+            f"--remote-allow-origins=* --user-data-dir={self.edge_profile}"
+        )
+        deadline = time.time() + self.restart_timeout_s
+        last = detail
+        while time.time() < deadline:
+            time.sleep(1.0)
+            ok, last = self._ws_probe()
+            if ok:
+                log.append("[preflight] 重启后 CDP 就绪")
+                return log
+        raise PMError(E_CDP_UNREACHABLE, f"自动重启后仍不可用：{last[:300]}")
+
     def build_steps(self, prompt: str) -> list[list[str]]:
         """CDP 五步命令清单（dry-run / 自检用，不执行）。"""
         sel = json.dumps(self.ANSWER_CONTAINER_SELECTOR)
@@ -252,7 +362,7 @@ class DeepSeekAdapter(WebAIAdapter):
             f"((Array.from(document.querySelectorAll({sel})).pop())||{{}}).innerText||''"
         )
         return [
-            ["status"],
+            ["eval", "1+1"],
             ["open", self.chat_url],
             ["type", self.INPUT_SELECTOR, prompt],
             ["click", self.SEND_BUTTON_SELECTOR],
@@ -268,8 +378,8 @@ class DeepSeekAdapter(WebAIAdapter):
         mode, _selector = resolve_web_ai_selector(self.selectors)
         if mode == "aiAct":
             return self._send_prompt_ai_act(full_prompt)
-        # ① 探测
-        self._cdp(["status"], timeout_s=30)
+        # ① 前置检查：CDP 探活（WS）；不可达或握手 403 → 自动重启调试 Edge
+        self.ensure_ready()
         # ② 导航
         proc = self._cdp(["open", self.chat_url], timeout_s=self.timeout_s)
         page_text = proc.stdout or ""

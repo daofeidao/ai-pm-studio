@@ -5,3 +5,5 @@ __pycache__/
 .demo-remote/
 .DS_Store
 activity.jsonl
+# 网页 AI 原始回答（运行时产物；证据已进 reports/e2e-*.md）
+reports/webai-deepseek-*.md

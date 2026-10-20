@@ -88,3 +88,11 @@
 - 测试结果：`web_ai.py --selftest` 全绿（demo 路径零浏览器进程）；真实 `ask "只回复两个字：收到"` → `[answer] 收到`，exit 0，回答落盘 `reports/webai-deepseek-20261020T125356Z.md`（已验证不含思考块/侧边栏文本）。
 - 建议下一步：把「Edge 启动参数必须含 `--remote-allow-origins=*`」接进编排器自检（如 `web_ai` 启动前置检查），避免换机/重启后再次退化成超时。
 - 备注：调试窗口用过两次真实提问，DeepSeek 侧留下两条「只回复两个字：收到」会话，需用户自行删除；`C:\temp\edge-pm` 是该实例专用 Profile。
+## ↪ Return · 2026-10-20T13:11:53Z · ask-web-ai 自愈 + E2E 闭环演练
+- 第 1 点（前置检查与自动重启）：`DeepSeekAdapter.ensure_ready()` 改为用 `cdp.py eval 1+1` 做 **WS 层**探活（`cdp.py status` 只查 HTTP，握手 403 时仍报 CDP_OK，不能当可用性依据）。探活失败（不可达或 403）时：只杀带 `--remote-debugging-port` 的 msedge（不动日常窗口）→ 以 `--remote-allow-origins=*` + `--user-data-dir=C:\temp\edge-pm` 重启 → 每秒重探直至 `restart_timeout_s`（40s）→ 仍失败才抛 `E_CDP_UNREACHABLE`。参数入 `pm.config.json web_ai`（debug_port/edge_exe/edge_profile/auto_restart/restart_timeout_s）。
+- 自愈实测：①杀掉调试实例（不可达）→ 自动拉起并就绪；②不带 `--remote-allow-origins` 启动（真实 403）→ 识别后重启并就绪。
+- 旧占位选择器：`lib/`、`pm.config.json`、`ask-web-ai/SKILL.md` 已无任何引用；仅 `SESSION.md` 历史 Return 保留当时的排障记录（append-only，不改写历史）。
+- 第 2 点（E2E）：新增 `tools/run_e2e_loop.py` —— ①真实 DeepSeek 把目标拆成 JSON 指令；②真实 dispatch-agent 解析 + 真实 worktree/任务分支 commit（编码用 HelloMockProvider，仅替换“写什么代码”）；③结果 + `MemoryService` 记忆包（6 行）回传，再真实提问一次。沙箱为临时 git 仓库，记忆阈值临时降至 100 字符以触发注入。
+- E2E 结果：**9/9 PASS**，总耗时 13.5s（第一跳 6.2s / 派发 0.6s / 第二跳 6.3s）。报告 `reports/e2e-loop-001.md` 含两次提问与回答原文、解析出的 JSON 指令、worktree 与提交、记忆包、回传后回答、验收点表。
+- 测试：`web_ai.py --selftest` 全绿（新增“Edge 自愈参数齐全”断言）；E2E 9/9。
+- 备注：E2E 每跑一次消耗 2 次网页提问（可重复跑，报告覆盖同一文件）；`reports/webai-deepseek-*.md` 为运行时产物已列入 `.gitignore`（证据已内嵌进 e2e 报告）；沙箱仓库留在 `%TEMP%\pm-e2e-loop-*`，可随时删除。

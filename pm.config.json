@@ -59,6 +59,11 @@
     "cdp_py": "C:/Users/Administrator/.workbuddy/skills/browser-automation-cdp/scripts/cdp.py",
     "timeout_s": 120,
     "poll_s": 3,
+    "debug_port": 9222,
+    "edge_exe": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "edge_profile": "C:/temp/edge-pm",
+    "auto_restart": true,
+    "restart_timeout_s": 40,
     "selectors": {
       "input": "textarea[placeholder*='发送消息']",
       "send_button": "div.bf38813a div[role=button]",
