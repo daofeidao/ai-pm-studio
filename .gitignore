@@ -7,3 +7,11 @@ __pycache__/
 activity.jsonl
 # 网页 AI 原始回答（运行时产物；证据已进 reports/e2e-*.md）
 reports/webai-deepseek-*.md
+
+.edge-pm/
+**/auth.json
+__pycache__/
+dist/
+build/
+*.spec
+.demo-remote/
