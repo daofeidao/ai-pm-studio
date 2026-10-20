@@ -7,6 +7,7 @@ import subprocess
 import json
 import re
 import socketserver
+import webbrowser
 from http.server import SimpleHTTPRequestHandler
 
 # 确保能找到 lib 目录
@@ -63,9 +64,13 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
     <div class="footer">
         <input id="task-input" type="text" placeholder="输入你想让项目经理做的任务（例如：写一个贪吃蛇脚本）...">
+        <button id="open-btn" style="background:#3a3a3a;">查看产物</button>
         <button id="start-btn">开始执行</button>
     </div>
     <script>
+        document.getElementById('open-btn').onclick = function() {
+            if(window.pywebview && window.pywebview.api) window.pywebview.api.open_output();
+        };
         document.getElementById('start-btn').onclick = function() {
             var val = document.getElementById('task-input').value;
             if(!val) return;
@@ -89,6 +94,34 @@ HTML_CONTENT = """<!DOCTYPE html>
 class Api:
     def start_task(self, goal):
         threading.Thread(target=self._run_task, args=(goal,), daemon=True).start()
+        return True
+
+    def open_output(self):
+        """打开产物：有 html 就丢给默认浏览器，否则打开 work 目录。"""
+        work_dir = os.path.join(os.path.expanduser("~"), ".pm-studio", "work")
+        os.makedirs(work_dir, exist_ok=True)
+        try:
+            htmls = sorted(
+                (p for p in os.listdir(work_dir) if p.lower().endswith((".html", ".htm"))),
+                key=lambda n: os.path.getmtime(os.path.join(work_dir, n)),
+                reverse=True,
+            )
+            if htmls:
+                webbrowser.open("file:///" + os.path.join(work_dir, htmls[0]).replace("\\", "/"))
+            else:
+                os.startfile(work_dir)
+        except Exception:
+            pass
+        return True
+
+    def open_workdir(self):
+        """打开产物目录。"""
+        work_dir = os.path.join(os.path.expanduser("~"), ".pm-studio", "work")
+        os.makedirs(work_dir, exist_ok=True)
+        try:
+            os.startfile(work_dir)
+        except Exception:
+            pass
         return True
 
     def _find_python(self):
@@ -118,6 +151,7 @@ class Api:
         os.makedirs(work_dir, exist_ok=True)
         
         def update_state(state, msg, code=None):
+            os.makedirs(os.path.dirname(state_file), exist_ok=True)
             data = {"current_state": state, "target": goal, "message": msg, "code": code}
             with open(state_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -131,7 +165,7 @@ class Api:
         try:
             cfg = load_config(os.path.join(base_dir, 'pm.config.json'))
             adapter = DeepSeekAdapter(base_dir, cfg)
-            prompt = f"你是一个本地自动化助手。请根据用户任务编写一段Python脚本，必须用 ```python 和 ``` 包裹。不要输出多余解释。任务：{goal}"
+            prompt = f"你是一个本地自动化助手。请根据用户任务编写一段Python脚本，必须用 ```python 和 ``` 包裹。要求：完整可运行，禁止用 ... 或「省略」缩写任何部分，不要输出多余解释。任务：{goal}"
             reply = adapter.send_prompt(prompt)
             reply_text = getattr(reply, 'text', reply)
 
@@ -152,8 +186,10 @@ class Api:
             
             result = subprocess.run([self._find_python(), script_path], capture_output=True, text=True, timeout=30, cwd=work_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-            
-            update_state("DONE", "执行完成！", code + "\n\n=== 运行结果 ===\n" + output)
+            warn = ""
+            if re.search(r'^\s*\.\.\.\s*$', code, re.MULTILINE):
+                warn = "\n\n[警告] 代码里含省略号 ...，说明 AI 偷懒没写全，产物可能不完整。重试一次或把任务拆小。"
+            update_state("DONE", "执行完成！", code + "\n\n=== 运行结果 ===\n" + output + f"\n\n产物目录：{work_dir}" + warn)
         except Exception as e:
             update_state("FAILED", f"执行发生异常: {str(e)}")
 
