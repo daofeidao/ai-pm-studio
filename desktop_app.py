@@ -91,6 +91,27 @@ class Api:
         threading.Thread(target=self._run_task, args=(goal,), daemon=True).start()
         return True
 
+    def _find_python(self):
+        """找真正能执行脚本的解释器。
+
+        打包成 exe 后 `sys.executable` 指向 PM-Studio.exe 本身，直接拿来跑生成代码
+        等于让程序再开一个自己（无限弹窗）。优先用 pm.config.json 里配的 python；
+        其次才是 PATH 里的 python，但跳过 WindowsApps 的微软商店占位壳（exit=9009）。
+        """
+        try:
+            cfg_py = load_config(os.path.join(base_dir, 'pm.config.json')).get('python') or ''
+        except Exception:
+            cfg_py = ''
+        if cfg_py and os.path.isfile(cfg_py):
+            return cfg_py
+        if 'python' in os.path.basename(sys.executable).lower():
+            return sys.executable
+        import shutil
+        cand = shutil.which('python')
+        if cand and 'windowsapps' not in cand.lower():
+            return cand
+        return 'python'
+
     def _run_task(self, goal):
         state_file = os.path.join(get_base_path(), 'dashboard_app', 'state.json')
         work_dir = os.path.join(os.path.expanduser("~"), ".pm-studio", "work")
@@ -129,7 +150,7 @@ class Api:
             with open(script_path, 'w', encoding='utf-8') as f:
                 f.write(code)
             
-            result = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=30, cwd=work_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            result = subprocess.run([self._find_python(), script_path], capture_output=True, text=True, timeout=30, cwd=work_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
             
             update_state("DONE", "执行完成！", code + "\n\n=== 运行结果 ===\n" + output)
