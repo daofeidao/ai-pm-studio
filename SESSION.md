@@ -72,3 +72,10 @@
 - 报告路径：reports/t5/sample-result.json
 - 建议下一步：按序 —— ①在线复采 1 次校准 `part.cost` 与异常形态 → ②LeanREA 逆向路由接线 → ③17 态审查表落地（先合并候选态）→ ④Magpie 真实网关联调（需在线）。
 - 备注：夹具 4 行按已确认的事件顺序与字段固化（仓库内未留存原始捕获文件；`part.cost` 真实数值未采集，置 0，累加逻辑由自检合成用例覆盖）；被替换的旧 `sample-result.json`（无凭证超时元数据）仍保留在 git 历史中。
+## ↪ Return · 2026-10-20T11:35:39Z · pm-orchestrator(T5 收尾)
+- 做了什么：①用**原始 4 行 NDJSON 字节**覆盖 `reports/t5/sample-result.json`（1751 字节 / LF / 4 行，未重排、未补字段），回放 19 项断言全绿，并新增「`part.cost` 真实值 0 被正确累加」断言；②确认事件分发**只读顶层 `type`**（真实样本顶层 `step_finish`/`tool_use` 用下划线，`part.type` 是 `step-finish`/`tool`），代码中无 part.type 比较，新增反证用例（故意让两者矛盾，解析必须只按顶层类型生效），并在解析处与文档写明；③确认 `step_finish.part.tokens` 是**本 step 增量**（实测同会话两步 input 分别 5145 / 372，若累计则第二步不可能更小），所以逐 key 累加正确、无需差分，结论写入 `docs/opencode-json-sample.md` §6.1c。
+- 改动文件：reports/t5/sample-result.json；lib/agent_provider.py；.workbuddy/skills/dispatch-agent/dispatcher.py；docs/opencode-json-sample.md
+- 测试结果：`agent_provider --selftest` 19/19（文本逐字、write/completed、call_id、token 5145/44/26、cost=0、sessionID、step_finish 后 text、坏行跳过、失败工具、多步累加、顶层 type 反证）；`dispatcher --selftest` 全绿（真实夹具回放含 cost）；demo QA happy 16/16。
+- 报告路径：reports/t5/sample-result.json
+- 建议下一步：在线复采 1 次补 `cache` 用量语义 → LeanREA 逆向路由接线 → 17 态审查表落地 → Magpie 联调。
+- 备注：原始文本与早前口述版**不一致**（原始含反引号：`OK\n\n已写入 `C:\temp\octest\a.txt`，内容为 `hello`。`），断言已按字节更正；`part.tokens.cache`（read 1536 / write 0）为嵌套对象，当前只累加顶层数值键，cache 暂不计入 tokens 汇总（预算用 cost）。

@@ -180,6 +180,10 @@ def parse_opencode_json(raw_stdout: str) -> AgentResult:
             continue
         events += 1
         session = _session_of(event, _part_of(event)) or session
+        # 事件类型**只看顶层 `type`**。真实样本存在命名不一致：
+        #   顶层：step_finish / tool_use（下划线）
+        #   part：step-finish / tool（连字符 / 单数）
+        # 用 part.type 分发会漏掉全部 step_finish / tool_use —— 这里刻意不读它。
         etype = event.get("type")
         part = _part_of(event)
 
@@ -199,7 +203,12 @@ def parse_opencode_json(raw_stdout: str) -> AgentResult:
                 "status": status,
                 "ok": status == "completed",           # 规则 4：非 completed 即失败
             }
-            call_id = part.get("callID") or part.get("call_id") or event.get("callID")
+            call_id = (
+                part.get("callID")
+                or part.get("call_id")
+                or part.get("id")           # 真实样本：tool_use 的 part.id 就是 call_id
+                or event.get("callID")
+            )
             if isinstance(call_id, str) and call_id:
                 call["call_id"] = call_id
             if isinstance(state.get("error"), str) and state["error"]:
@@ -207,6 +216,8 @@ def parse_opencode_json(raw_stdout: str) -> AgentResult:
             tool_calls.append(call)
 
         elif etype == "step_finish":
+            # tokens 是**本 step 的增量**（实测两个 step 分别为 input=5145 / 372，
+            # 非累计），因此逐 step 累加即会话总量，不存在重复计算。
             raw_tokens = part.get("tokens")
             if not isinstance(raw_tokens, dict):       # 兼容：老夹具放顶层
                 raw_tokens = event.get("tokens")
@@ -667,7 +678,8 @@ class MockWorkBuddyProvider(WorkBuddyProvider):
 FIXTURE_JSON = (
     Path(__file__).resolve().parents[1] / "reports" / "t5" / "sample-result.json"
 )
-EXPECTED_TEXT = "OK\n\n已写入 C:\\temp\\octest\\a.txt，内容为 hello。"
+EXPECTED_TEXT = "OK\n\n已写入 `C:\\temp\\octest\\a.txt`，内容为 `hello`。"
+EXPECTED_SESSION = "ses_ea70675b5ffeAMM5VmhMEBdAAt"
 
 
 def _selftest() -> int:
@@ -687,9 +699,12 @@ def _selftest() -> int:
                    and r.tool_calls[0].get("tool") == "write"
                    and r.tool_calls[0].get("status") == "completed"
                    and r.tool_calls[0].get("ok") is True))
+    checks.append(("回放：工具调用 id 取自 part.id",
+                   r.tool_calls[0].get("call_id") == "call_b10ee7f5c5c04446a3882642"))
     checks.append(("回放：token 累计 input=5145/output=44/reasoning=26",
                    r.tokens == {"input": 5145, "output": 44, "reasoning": 26}))
-    checks.append(("回放：sessionID 提取", r.session_id == "ses_octest_0001"))
+    checks.append(("回放：part.cost 的真实值 0 被正确累加", r.cost_usd == 0.0))
+    checks.append(("回放：sessionID 提取", r.session_id == EXPECTED_SESSION))
     checks.append(("回放：step_finish 之后的 text 仍被取到（EOF 才是结束）", bool(r.text)))
 
     # —— 2. 坏行跳过，继续读到 EOF ——
@@ -741,6 +756,22 @@ def _selftest() -> int:
     # —— 8. 兼容 v2.0 顶层 text（老夹具形态） ——
     legacy = parse_opencode_json('{"type":"text","text":"老形态"}')
     checks.append(("兼容 v2.0 顶层 text", legacy.text == "老形态"))
+
+    # —— 9. 事件类型只看顶层 type：part.type 命名不一致（step-finish / tool）不得误判 ——
+    mixed = parse_opencode_json(
+        '{"type":"text","part":{"type":"step-finish","text":"文本事件",'
+        '"tokens":{"input":999},"cost":9.9}}\n'
+        '{"type":"tool_use","part":{"type":"text","tool":"bash",'
+        '"text":"不该被当文本","state":{"status":"completed"}}}\n'
+        '{"type":"step_finish","part":{"type":"tool","tokens":{"input":10},"cost":0.5}}\n'
+    )
+    checks.append(("按顶层 type 判定：part.type=step-finish 的 text 只出文本、不记 token/cost",
+                   mixed.text == "文本事件"))
+    checks.append(("按顶层 type 判定：part.type=text 的 tool_use 记工具、不拼文本",
+                   len(mixed.tool_calls) == 1 and mixed.tool_calls[0]["tool"] == "bash"
+                   and mixed.text == "文本事件"))
+    checks.append(("按顶层 type 判定：part.type=tool 的 step_finish 仍累计 token/cost",
+                   mixed.tokens == {"input": 10} and abs(mixed.cost_usd - 0.5) < 1e-9))
 
     failed = 0
     for name, ok in checks:

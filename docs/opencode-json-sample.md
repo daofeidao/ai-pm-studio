@@ -148,16 +148,25 @@ timestamp=2026-10-20T08:20:57.931Z level=INFO run=dc9687c1 message="spawning pro
 6. 一个可解析事件都没有 -> `E_OPENCODE_BAD_JSON=43`；
    读到 EOF 仍无 text -> `E_AGENT_RESULT_INVALID=41`。
 
-回放夹具：`reports/t5/sample-result.json`（4 行真实输出），
-`python lib/agent_provider.py --selftest` 逐字校验：
+回放夹具：`reports/t5/sample-result.json` —— **原始 4 行 NDJSON 原样保存**
+（1751 字节，LF 行尾，未做任何重排/补字段）。`python lib/agent_provider.py --selftest`
+逐字校验：
 
 ```text
 [OK] 夹具为 4 行且每行独立可解析
 [OK] 回放：文本逐字一致
 [OK] 回放：1 条 write 工具且 status=completed
+[OK] 回放：工具调用 id 取自 part.id
 [OK] 回放：token 累计 input=5145/output=44/reasoning=26
+[OK] 回放：part.cost 的真实值 0 被正确累加
 [OK] 回放：step_finish 之后的 text 仍被取到（EOF 才是结束）
 ```
+
+> 注意两点实测细节：
+> 1. 真实回复文本**带反引号**：`OK\n\n已写入 \`C:\temp\octest\a.txt\`，内容为 \`hello\`。`
+>    （此前口述版本漏了反引号；断言以**原始字节**为准）。
+> 2. `part.tokens` 里的 `cache.read/write` 是**嵌套对象**，当前只累加顶层数值键
+>    （input/output/reasoning）；cache 用量暂不计入 `tokens` 汇总，预算熔断用 `cost`。
 
 ### 6.1b 校正点 1b：collect 阶段无条件 porcelain 检查（已实施）
 
@@ -165,6 +174,37 @@ timestamp=2026-10-20T08:20:57.931Z level=INFO run=dc9687c1 message="spawning pro
 所以 `--auto` / 权限位都不能当安全前提。编排器现在在**每个成功轮次进入 COLLECTING
 之前无条件**跑 main 工作区 `git status --porcelain`（`_collect_escape_check`），
 只报相对派发前基线**新增**、且不在编排器记账目录里的改动，命中即 `security_violation` -> PAUSE。
+
+### 6.1c 结论：`step_finish.part.tokens` 是**本 step 增量**，不是会话累计
+
+**结论：增量**。因此 `parse_opencode_json` 对多个 `step_finish` **逐键累加是正确的**，
+不会重复计算；不需要改成「取最后一个」或「取差分」。
+
+证据（本机 opencode 会话库 `~/.local/share/opencode/opencode.db`，
+会话 `ses_ea70675b5ffeAMM5VmhMEBdAAt` / 目录 `C:/temp/octest`，本次实测同一会话）：
+
+| 事件 | step | `part.tokens.input` | `part.tokens.output` | `part.tokens.reasoning` |
+|------|------|--------------------|----------------------|-------------------------|
+| 第 1 个 `step_finish`（工具调用步） | step 1 | 5145 | 44 | 26 |
+| 第 2 个 `step_finish`（收尾文本步） | step 2 | 372 | 22 | 0 |
+
+若为**累计值**，第 2 步的 `input` 必须 ≥ 5145；实测只有 372，
+说明每个 `step_finish` 携带的是**该次 LLM 调用自身的用量**。
+累加后得到会话总用量（5145+372=5517，与 provider 侧计费口径的差异来自缓存/系统提示计数，不影响「逐 step 增量」这一结论）。
+
+### 6.1d 事件类型只认顶层 `type`（part.type 命名不一致）
+
+真实样本里两处命名**不一致**，且不可混用：
+
+| 位置 | step_finish | tool_use |
+|------|-------------|----------|
+| 顶层 `type` | `step_finish`（下划线） | `tool_use`（下划线） |
+| `part.type` | `step-finish`（连字符） | `tool`（单数） |
+
+`lib/agent_provider.py::parse_opencode_json` **只用顶层 `type` 分发**，从不读 `part.type`；
+`part` 只作为 payload 容器（`text` / `tool` / `state` / `tokens` / `cost`）。
+自检里加了反证用例：故意让 `part.type` 与顶层 `type` 矛盾（如 `type=text` 而
+`part.type=step-finish`），解析结果必须只按顶层类型生效。
 
 ### 6.2 校正点 2：空 stdout 显式化（已实施）
 

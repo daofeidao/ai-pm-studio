@@ -591,11 +591,12 @@ def _selftest() -> int:
         fixture = (ROOT / "reports" / "t5" / "sample-result.json").read_text(encoding="utf-8")
         replay = ap.parse_opencode_json(fixture)
         checks.append(("真实样本回放：文本逐字一致",
-                       replay.text == "OK\n\n已写入 C:\\temp\\octest\\a.txt，内容为 hello。"))
-        checks.append(("真实样本回放：write/completed + token 累计",
+                       replay.text == "OK\n\n已写入 `C:\\temp\\octest\\a.txt`，内容为 `hello`。"))
+        checks.append(("真实样本回放：write/completed + token 累计 + cost=0",
                        len(replay.tool_calls) == 1 and replay.tool_calls[0]["tool"] == "write"
                        and replay.tool_calls[0]["ok"] is True
-                       and replay.tokens == {"input": 5145, "output": 44, "reasoning": 26}))
+                       and replay.tokens == {"input": 5145, "output": 44, "reasoning": 26}
+                       and replay.cost_usd == 0.0))
         # 空 stdout -> E_OPENCODE_BAD_JSON
         try:
             ap.parse_opencode_json("")
