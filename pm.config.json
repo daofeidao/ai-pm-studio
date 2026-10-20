@@ -3,7 +3,7 @@
   "project": "pm-software",
   "_comment": "全局配置。root 仅作文档记录，代码一律用 __file__ 推导的仓库根（支持 clone 到任意路径续跑）。",
   "root": "C:/Users/Administrator/WorkBuddy/2026-10-20-11-29-05/pm-software",
-  "python": "C:/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe",
+  "python": "C:/Users/lion/.workbuddy/binaries/python/versions/3.13.12/python.exe",
   "node": "node",
   "git": {
     "exe": "git",
@@ -30,7 +30,7 @@
     "script_index": "script-index.json"
   },
   "opencode": {
-    "exe": "C:/Users/Administrator/AppData/Local/Programs/@opencodedesktop/resources/opencode-cli.exe",
+    "exe": "C:/Users/lion/AppData/Local/Programs/@opencodedesktop/resources/opencode-cli.exe",
     "model": "",
     "timeout_s": 1800,
     "stats_days": 30,
@@ -56,7 +56,7 @@
   "web_ai": {
     "provider": "deepseek",
     "chat_url": "https://chat.deepseek.com",
-    "cdp_py": "C:/Users/Administrator/.workbuddy/skills/browser-automation-cdp/scripts/cdp.py",
+    "cdp_py": "C:/Users/lion/.workbuddy/skills/browser-automation-cdp/scripts/cdp.py",
     "timeout_s": 120,
     "poll_s": 3,
     "debug_port": 9222,
@@ -66,7 +66,7 @@
     "restart_timeout_s": 40,
     "selectors": {
       "input": "textarea[placeholder*='发送消息']",
-      "send_button": "div.bf38813a div[role=button]",
+      "send_button": "div.bf38813a div[role=button].ds-button--primary",
       "answer_container": "div.ds-message div.ds-markdown"
     }
   },
@@ -93,8 +93,14 @@
     "bare_name": "pm-software.git"
   },
   "capability_probe": {
-    "dsh": { "enabled": null },
-    "openclaw": { "enabled": null },
-    "codebuddy": { "enabled": null }
+    "dsh": {
+      "enabled": null
+    },
+    "openclaw": {
+      "enabled": null
+    },
+    "codebuddy": {
+      "enabled": null
+    }
   }
 }

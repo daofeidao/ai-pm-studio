@@ -50,7 +50,7 @@ from demo_fixtures import DEMO_WEB_REPLY, demo_reply_for_round
 #:     正式回答是 `div.ds-message div.ds-markdown`。
 DEEPSEEK_SELECTORS: dict[str, str] = {
     "input": "textarea[placeholder*='发送消息']",
-    "send_button": "div.bf38813a div[role=button]",
+    "send_button": "div.bf38813a div[role=button].ds-button--primary",
     "answer_container": "div.ds-message div.ds-markdown",
 }
 
@@ -250,6 +250,24 @@ class DeepSeekAdapter(WebAIAdapter):
         )
         return self._eval(js).strip()
 
+    def last_code(self) -> str:
+        """取最后一个回答里的代码块内容（DOM 渲染后 innerText 不含 ``` 围栏）。
+
+        DeepSeek 的代码块渲染成 `<pre>`，且内部不一定有 `<code>` 子节点，
+        所以直接取最后一个 `pre` 的 innerText，剥掉「复制/下载」按钮文字。
+        """
+        sel_code = self.ANSWER_CONTAINER_SELECTOR + " pre"
+        js = (
+            f"((Array.from(document.querySelectorAll({json.dumps(sel_code)})).pop())"
+            " || {}).innerText || ''"
+        )
+        raw = self._eval(js).strip()
+        lines = [
+            ln for ln in raw.splitlines()
+            if ln.strip() not in ("", "复制", "下载", "Copy", "Download")
+        ]
+        return "\n".join(lines)
+
     def _send_by_enter(self) -> None:
         """发送钮点击无效时的兜底：向输入框派发 Enter 键事件（实测可提交）。"""
         js = (
@@ -315,6 +333,10 @@ class DeepSeekAdapter(WebAIAdapter):
                 f"--remote-debugging-port={self.debug_port}",
                 "--remote-allow-origins=*",
                 f"--user-data-dir={self.edge_profile}",
+                # 窗口尺寸：不指定时可能恢复成极窄/极扁窗口，页面退化成窄屏布局，
+                # 导致「发送按钮」「回答容器」选择器全部失效（实测 360x50）
+                "--window-size=1280,900",
+                "--window-position=40,40",
                 self.chat_url,
             ],
             stdout=subprocess.DEVNULL,

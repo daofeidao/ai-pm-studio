@@ -15,3 +15,4 @@ dist/
 build/
 *.spec
 .demo-remote/
+dashboard_app/
