@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "agent": "opencode",
+  "summary": "已生成 work/demo-login.html 并提交到 task 分支",
+  "artifacts": [
+    "work/demo-login.html"
+  ],
+  "irreversible_ops": [],
+  "error_code": null,
+  "error_detail": null,
+  "session_id": "ses_demo_001",
+  "duration_ms": 1234
+}

@@ -1,20 +1,19 @@
 # HANDOFF · 交接摘要
 
-> 生成：1970-01-01T00:00:00Z · 生成方：pm-orchestrator · 机器：INIT-TEMPLATE
+> 生成：2026-10-20T07:35:39Z · 生成方：pm-orchestrator · 机器：DESKTOP-ORJQ9KI
 
 ## 1. 当前目标
-（待编排器首次 run 填写）
+演示任务
 
 ## 2. 已定约束
 - 内存可用仅 2.68GB，零常驻进程
 - 不可逆操作必须人工审批
 
 ## 3. 关键文件
-- HANDOFF.md：本交接摘要
-- pm/state:state/current.json：最小状态指针
+- work/demo-login.html：本轮改动
 
 ## 4. 待办清单
-- [ ] 执行 orchestrator.py run 启动首轮闭环
+- [ ] 继续推进：演示任务
 
 ## 5. 已知阻塞/坑
-- （暂无）
+- （无）
