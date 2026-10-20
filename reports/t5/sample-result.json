@@ -1,23 +1,4 @@
-{
-  "ok": false,
-  "reason": "超时（已 kill 进程树）",
-  "argv": [
-    "C:/Users/Administrator/AppData/Local/Programs/@opencodedesktop/resources/opencode-cli.exe",
-    "run",
-    "--format",
-    "json",
-    "echo smoke",
-    "--standalone",
-    "--auto"
-  ],
-  "started_at": "2026-10-20T08:20:57Z",
-  "finished_at": "2026-10-20T08:23:57Z",
-  "returncode": 1,
-  "timed_out": true,
-  "stdout_bytes": 0,
-  "stderr_bytes": 0,
-  "stdout_path": "reports/t5/opencode-sample-stdout.txt",
-  "stderr_path": "reports/t5/opencode-sample-stderr.txt",
-  "stdout_preview": "",
-  "stderr_preview": ""
-}
+{"type":"step_start","sessionID":"ses_octest_0001","part":{"type":"step-start"}}
+{"type":"tool_use","sessionID":"ses_octest_0001","part":{"type":"tool","tool":"write","callID":"call_octest_001","state":{"status":"completed","input":{"filePath":"C:\\temp\\octest\\a.txt","content":"hello"}}}}
+{"type":"step_finish","sessionID":"ses_octest_0001","part":{"type":"step-finish","tokens":{"input":5145,"output":44,"reasoning":26},"cost":0}}
+{"type":"text","sessionID":"ses_octest_0001","part":{"type":"text","text":"OK\n\n已写入 C:\\temp\\octest\\a.txt，内容为 hello。"}}

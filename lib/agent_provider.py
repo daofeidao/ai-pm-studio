@@ -26,6 +26,7 @@ from pm_common import (
     E_AGENT_CRASH,
     E_AGENT_RESULT_INVALID,
     E_AGENT_TIMEOUT,
+    E_OK,
     E_OPENCODE_BAD_JSON,
     E_SCRIPT_NOT_FOUND,
     PMError,
@@ -83,17 +84,24 @@ class TaskSpec:
 
 @dataclass
 class AgentResult:
-    """代理执行结果（v2 增加 error_detail / session_id）。"""
+    """代理执行结果（v2 增加 error_detail / session_id；v2.1 增加流式用量字段）。"""
 
     status: str = "success"
     agent: str = ""
     summary: str = ""
+    text: str = ""                     # 完整回复文本（summary 是截断版）
     artifacts: list[str] = field(default_factory=list)
     irreversible_ops: list[str] = field(default_factory=list)
     error_code: int | None = None
     error_detail: str | None = None
     session_id: str | None = None
     duration_ms: int = 0
+    #: `type=="tool_use"` 事件提取的工具调用记录（ok=False 即失败）
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    #: `type=="step_finish"` 累计的 token（input/output/reasoning/cache_* …）
+    tokens: dict[str, int] = field(default_factory=dict)
+    #: `type=="step_finish"` 累计的花费（USD）
+    cost_usd: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -110,92 +118,131 @@ def _dig_text(obj: Any, path: tuple[str, ...]) -> Any:
     return cur
 
 
-def _extract_text(obj: dict) -> str:
-    """按多候选键路径探测 text 字段（兼容未固化 schema，Q4）。"""
-    for path in (("text",), ("message", "content"), ("content",), ("parts",)):
-        v = _dig_text(obj, path)
-        if isinstance(v, str) and v.strip():
-            return v
-        if isinstance(v, list):
-            joined = "".join(
-                p.get("text", "") for p in v if isinstance(p, dict) and isinstance(p.get("text"), str)
-            )
-            if joined.strip():
-                return joined
-    return ""
+def _part_of(event: dict[str, Any]) -> dict[str, Any]:
+    """事件 payload：真实形态在 `part` 里，缺失时返回空 dict。"""
+    part = event.get("part")
+    return part if isinstance(part, dict) else {}
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _session_of(*objs: dict[str, Any]) -> str | None:
+    for obj in objs:
+        for k in ("sessionID", "session_id", "sessionId"):
+            v = obj.get(k)
+            if isinstance(v, str) and v:
+                return v
+    return None
 
 
 def parse_opencode_json(raw_stdout: str) -> AgentResult:
-    """解析 `opencode run --format json` 输出。
+    """解析 `opencode run --format json` 的 **NDJSON 流**（v2.1 T5 实测校正）。
 
-    解析策略（v2.1 T5，按真实样本校正）：
-    1. 先试整串 `json.loads` —— 兼容「输出单个 JSON 对象」；
-    2. 失败则**按行/流式解析**（NDJSON）：逐行 `json.loads`，
-       **按出现顺序累加**所有含 text 的片段（流式输出的文本被拆成多行时，
-       只取最后一行会丢内容），并取最后一个出现的 sessionID；
-    3. 字段多候选探测：text / sessionID / tokens；
-    4. 取不到 text -> E_AGENT_RESULT_INVALID=41；整行都不可解析 -> E_OPENCODE_BAD_JSON=43。
+    真实形态（2026-10-20 实测，回放夹具 `reports/t5/sample-result.json`）：
+    每行一个独立 JSON 事件，顶层有 `type`，四类 payload 在 `part` 里 ——
+    `step_start` / `tool_use` / `step_finish` / `text`。
 
-    真实样本观测见 `docs/opencode-json-sample.md`（含 stdout 为空的场景）。
+    解析规则：
+    1. **逐行** `json.loads`，无法解析的行直接跳过；读到 **stdout EOF** 才算结束；
+    2. `step_finish` **不是**完成信号 —— 实测顺序是
+       `step_start -> tool_use -> step_finish -> text`，其后仍可能有 text，
+       因此绝不因 step_finish 提前返回；
+    3. 回复文本 = 所有 `type=="text"` 事件的 `part.text`，按出现顺序拼接；
+    4. 工具调用 = 所有 `type=="tool_use"` 事件的 `part.tool` + `part.state`，
+       `part.state.status != "completed"` 记为失败（`ok=False`）；
+    5. token / 成本 = 所有 `type=="step_finish"` 的 `part.tokens`（逐键累加）
+       与 `part.cost`（累加），写入 `activity.jsonl` 作为预算熔断数据源；
+    6. 一个可解析事件都没有 -> `E_OPENCODE_BAD_JSON=43`；
+       读到 EOF 仍无文本 -> `E_AGENT_RESULT_INVALID=41`。
+
+    兼容：`part` 缺失时退回顶层 `text` / `tokens` / `cost_usd`（v2.0 老夹具形态）。
     """
-    text = (raw_stdout or "").strip()
-    if not text:
-        raise PMError(E_OPENCODE_BAD_JSON, "opencode json 输出为空（无 stdout）")
+    pieces: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    tokens: dict[str, int] = {}
+    cost = 0.0
+    session: str | None = None
+    events = 0
 
-    obj: Any = None
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        # 按行/流式解析：累加所有 text 片段，保持顺序
-        pieces: list[str] = []
-        session: str | None = None
-        parsed_any = False
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                candidate = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(candidate, dict):
-                continue
-            parsed_any = True
-            piece = _extract_text(candidate)
-            if piece:
+    for raw_line in (raw_stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue                                   # 规则 1：坏行跳过，继续读到 EOF
+        if not isinstance(event, dict):
+            continue
+        events += 1
+        session = _session_of(event, _part_of(event)) or session
+        etype = event.get("type")
+        part = _part_of(event)
+
+        if etype == "text":
+            piece = part.get("text")
+            if not isinstance(piece, str):             # 兼容：老夹具把 text 放顶层
+                piece = event.get("text")
+            if isinstance(piece, str):
                 pieces.append(piece)
-            for k in ("sessionID", "session_id", "sessionId"):
-                v = candidate.get(k)
-                if isinstance(v, str) and v:
-                    session = v
-        if parsed_any and pieces:
-            obj = {
-                "text": "".join(pieces),
-                **({"sessionID": session} if session else {}),
+
+        elif etype == "tool_use":
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            status = state.get("status")
+            status = status if isinstance(status, str) and status else "unknown"
+            call: dict[str, Any] = {
+                "tool": part.get("tool") or event.get("tool") or "",
+                "status": status,
+                "ok": status == "completed",           # 规则 4：非 completed 即失败
             }
-        else:
-            obj = None
-    if not isinstance(obj, dict):
-        raise PMError(E_OPENCODE_BAD_JSON, "opencode json 输出不可解析（整串与按行均失败）")
+            call_id = part.get("callID") or part.get("call_id") or event.get("callID")
+            if isinstance(call_id, str) and call_id:
+                call["call_id"] = call_id
+            if isinstance(state.get("error"), str) and state["error"]:
+                call["error"] = state["error"]
+            tool_calls.append(call)
 
-    out_text = _extract_text(obj)
+        elif etype == "step_finish":
+            raw_tokens = part.get("tokens")
+            if not isinstance(raw_tokens, dict):       # 兼容：老夹具放顶层
+                raw_tokens = event.get("tokens")
+            if isinstance(raw_tokens, dict):
+                for key, value in raw_tokens.items():
+                    num = _as_float(value)
+                    if num is not None:
+                        tokens[str(key)] = tokens.get(str(key), 0) + int(num)
+            raw_cost = part.get("cost")
+            if raw_cost is None:
+                raw_cost = event.get("cost_usd")
+            num_cost = _as_float(raw_cost)
+            if num_cost is not None:
+                cost += num_cost
+
+        # step_start：无 payload 需要提取（规则 2：它和 step_finish 都不是完成信号）
+
+    if events == 0:
+        raise PMError(E_OPENCODE_BAD_JSON, "opencode json 输出不可解析（逐行 json.loads 无一成功）")
+
+    out_text = "".join(pieces)
     if not out_text.strip():
-        raise PMError(E_AGENT_RESULT_INVALID, "opencode json 中取不到 text 字段")
+        raise PMError(E_AGENT_RESULT_INVALID, "opencode 流读到 EOF 仍取不到 text 事件")
 
-    session = None
-    for k in ("sessionID", "session_id", "sessionId"):
-        v = obj.get(k)
-        if isinstance(v, str) and v:
-            session = v
-            break
     return AgentResult(
         status="success",
         agent="opencode",
         summary=out_text.strip()[:200],
+        text=out_text,
         artifacts=[],
         irreversible_ops=detect_irreversible_ops(out_text),
         session_id=session,
         duration_ms=0,
+        tool_calls=tool_calls,
+        tokens=tokens,
+        cost_usd=round(cost, 8),
     )
 
 
@@ -393,6 +440,31 @@ class OpenCodeProvider(AgentProvider):
         atomic_write_text(p, raw or "")
         return str(p.relative_to(self.root))
 
+    def _record_usage(self, task: TaskSpec, result: AgentResult) -> None:
+        """把 step_finish 累计的 token/cost 记进 activity.jsonl（预算熔断数据源）。
+
+        为什么记 activity 而不是解析 `opencode stats`：stats 是**事后**汇总且要多起
+        一个子进程；流里的 step_finish 是**本次调用**的即时用量，编排器可直接消费。
+        """
+        if not result.tokens and not result.cost_usd:
+            return
+        try:
+            from activity import ActivityLog
+
+            ActivityLog(self.root).append(
+                "agent_usage",
+                agent=result.agent or "opencode",
+                task_id=task.id,
+                session_id=result.session_id,
+                tokens=dict(result.tokens),
+                total_tokens=sum(result.tokens.values()),
+                cost_usd=round(result.cost_usd, 8),
+                tool_calls=len(result.tool_calls),
+                failed_tool_calls=sum(1 for c in result.tool_calls if not c.get("ok")),
+            )
+        except Exception as e:  # noqa: BLE001 —— 记账失败不阻塞本轮交付
+            print(f"[PM] 警告：agent_usage 记账失败（{e!r}），不影响本轮结果")
+
     def run(self, task: TaskSpec, handoff_path: Path) -> AgentResult:
         started = time.time()
         wt = self._ensure_worktree(task)
@@ -428,6 +500,7 @@ class OpenCodeProvider(AgentProvider):
                 duration_ms=int((time.time() - started) * 1000),
             )
         result.duration_ms = int((time.time() - started) * 1000)
+        self._record_usage(task, result)
         return result
 
     def check_quota(self) -> QuotaInfo:
@@ -584,3 +657,115 @@ class MockWorkBuddyProvider(WorkBuddyProvider):
             session_id=None,
             duration_ms=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# 自检：T5 真实 NDJSON 回放 + 边界用例
+# ---------------------------------------------------------------------------
+
+#: 真实样本回放夹具（4 行 NDJSON，`opencode run --format json` 输出原样）
+FIXTURE_JSON = (
+    Path(__file__).resolve().parents[1] / "reports" / "t5" / "sample-result.json"
+)
+EXPECTED_TEXT = "OK\n\n已写入 C:\\temp\\octest\\a.txt，内容为 hello。"
+
+
+def _selftest() -> int:
+    checks: list[tuple[str, bool]] = []
+
+    # —— 1. 回放真实夹具 ——
+    raw = FIXTURE_JSON.read_text(encoding="utf-8")
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    checks.append(("夹具为 4 行且每行独立可解析", len(lines) == 4
+                   and all(isinstance(json.loads(ln), dict) for ln in lines)))
+
+    r = parse_opencode_json(raw)
+    checks.append(("回放：文本逐字一致", r.text == EXPECTED_TEXT))
+    checks.append(("回放：summary 为去空白截断版", r.summary == EXPECTED_TEXT.strip()[:200]))
+    checks.append(("回放：1 条 write 工具且 status=completed",
+                   len(r.tool_calls) == 1
+                   and r.tool_calls[0].get("tool") == "write"
+                   and r.tool_calls[0].get("status") == "completed"
+                   and r.tool_calls[0].get("ok") is True))
+    checks.append(("回放：token 累计 input=5145/output=44/reasoning=26",
+                   r.tokens == {"input": 5145, "output": 44, "reasoning": 26}))
+    checks.append(("回放：sessionID 提取", r.session_id == "ses_octest_0001"))
+    checks.append(("回放：step_finish 之后的 text 仍被取到（EOF 才是结束）", bool(r.text)))
+
+    # —— 2. 坏行跳过，继续读到 EOF ——
+    noisy = "opencode starting...\n" + raw + "\n{broken\n"
+    checks.append(("坏行跳过、其余照常解析", parse_opencode_json(noisy).text == EXPECTED_TEXT))
+
+    # —— 3. 多段 text 按顺序拼接 ——
+    multi = parse_opencode_json(
+        '{"type":"text","part":{"text":"第一段："}}\n'
+        '{"type":"text","part":{"text":"第二段"}}\n'
+    )
+    checks.append(("多段 text 按顺序拼接", multi.text == "第一段：第二段"))
+
+    # —— 4. 无 text -> E_AGENT_RESULT_INVALID ——
+    try:
+        parse_opencode_json('{"type":"step_start","part":{}}\n')
+        checks.append(("无 text 事件 -> E_AGENT_RESULT_INVALID", False))
+    except PMError as e:
+        checks.append(("无 text 事件 -> E_AGENT_RESULT_INVALID", e.code == E_AGENT_RESULT_INVALID))
+
+    # —— 5. 全坏行 -> E_OPENCODE_BAD_JSON ——
+    try:
+        parse_opencode_json("not json\nstill not json\n")
+        checks.append(("全部行不可解析 -> E_OPENCODE_BAD_JSON", False))
+    except PMError as e:
+        checks.append(("全部行不可解析 -> E_OPENCODE_BAD_JSON", e.code == E_OPENCODE_BAD_JSON))
+
+    # —— 6. 非 completed 的工具调用记为失败 ——
+    tool_fail = parse_opencode_json(
+        '{"type":"tool_use","part":{"tool":"bash","state":{"status":"error","error":"boom"}}}\n'
+        '{"type":"text","part":{"text":"x"}}\n'
+    )
+    checks.append(("非 completed 的工具记为失败（ok=False）",
+                   len(tool_fail.tool_calls) == 1
+                   and tool_fail.tool_calls[0]["ok"] is False
+                   and tool_fail.tool_calls[0]["status"] == "error"
+                   and tool_fail.tool_calls[0].get("error") == "boom"))
+
+    # —— 7. 多个 step_finish 的 token/cost 累加 ——
+    cost = parse_opencode_json(
+        '{"type":"step_finish","part":{"tokens":{"input":1},"cost":0.25}}\n'
+        '{"type":"step_finish","part":{"tokens":{"input":2,"output":3},"cost":0.5}}\n'
+        '{"type":"text","part":{"text":"done"}}\n'
+    )
+    checks.append(("多 step_finish 的 token/cost 累加",
+                   cost.tokens == {"input": 3, "output": 3}
+                   and abs(cost.cost_usd - 0.75) < 1e-9))
+
+    # —— 8. 兼容 v2.0 顶层 text（老夹具形态） ——
+    legacy = parse_opencode_json('{"type":"text","text":"老形态"}')
+    checks.append(("兼容 v2.0 顶层 text", legacy.text == "老形态"))
+
+    failed = 0
+    for name, ok in checks:
+        print(f"  [{'OK' if ok else 'FAIL'}] {name}")
+        if not ok:
+            failed += 1
+    if failed:
+        print(f"[FAIL] agent_provider selftest：{failed} 项未过")
+        return 1
+    print("[OK] agent_provider selftest 全部通过（T5 回放 + 流式边界）")
+    return E_OK
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="agent_provider：opencode NDJSON 解析回放自检")
+    parser.add_argument("--selftest", action="store_true", help="运行自检")
+    args = parser.parse_args(argv)
+    if args.selftest:
+        return _selftest()
+    parser.print_help()
+    return E_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

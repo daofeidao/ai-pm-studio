@@ -93,11 +93,12 @@ DEMO_QUOTA_STALE: dict = {
 }
 
 # ---------------------------------------------------------------------------
-# 假 `opencode run --format json` 输出（NDJSON：整体不可解析，按行取最后一个对象）
+# 假 `opencode run --format json` 输出（NDJSON：逐行事件，payload 在 part 里）
 # ---------------------------------------------------------------------------
-DEMO_OPENCODE_JSON: str = """{"type":"step_start","sessionID":"ses_demo_001","timestamp":"2026-10-20T11:35:00Z"}
-{"type":"text","sessionID":"ses_demo_001","text":"已创建 work/demo-login.html 并补充表单校验"}
-{"type":"step_finish","sessionID":"ses_demo_001","tokens":{"input":1200,"output":300},"cost_usd":0.0042}
+DEMO_OPENCODE_JSON: str = """{"type":"step_start","sessionID":"ses_demo_001","part":{"type":"step-start"}}
+{"type":"tool_use","sessionID":"ses_demo_001","part":{"type":"tool","tool":"write","state":{"status":"completed"}}}
+{"type":"step_finish","sessionID":"ses_demo_001","part":{"type":"step-finish","tokens":{"input":1200,"output":300},"cost":0.0042}}
+{"type":"text","sessionID":"ses_demo_001","part":{"type":"text","text":"已创建 work/demo-login.html 并补充表单校验"}}
 """
 
 # ---------------------------------------------------------------------------

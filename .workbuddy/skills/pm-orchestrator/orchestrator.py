@@ -96,6 +96,23 @@ class LoopPhase(str, Enum):
     FAILED = "FAILED"
 
 
+#: COLLECTING 阶段 `git status --porcelain` 的放行前缀 —— 编排器自己的记账/证据目录。
+#: 其余任何 worktree 之外的改动都视为越界（见 `_collect_escape_check`）。
+COLLECT_OWN_PREFIXES: tuple[str, ...] = (
+    "worktrees/",
+    "reports/",
+    "dashboard/",
+    "memory/",
+    "commands/",
+    "state/",
+    "activity.jsonl",
+    "SESSION.md",
+    "HANDOFF.md",
+    ".demo-remote/",
+    "__pycache__/",
+)
+
+
 #: 网页 AI 回复「任务完成」语义标记（据此收尾不派活）
 DONE_MARKERS: tuple[str, ...] = ("已完成", "无需继续派活", "任务完成", "无需进一步改动")
 
@@ -223,6 +240,8 @@ class Orchestrator:
         )
         #: 上一次审批是否处于「无决策、落盘等待」状态（_run_task 据此停止）
         self._awaiting_approval: bool = False
+        #: 派发前 main 工作区的脏文件基线（collect 阶段只报**新增**越界，不误伤既有改动）
+        self._dirty_before_dispatch: set[str] | None = None
         # T2：demo 演练「主路径选择器缺失」开关
         self.demo_selector_missing: bool = False
         # T3：demo 演练「代理越界写 worktree 之外」开关
@@ -684,6 +703,11 @@ class Orchestrator:
         """
         auditor = SecurityAuditor(self.root, worktree_rel_for(spec))
         before = auditor.snapshot()
+        # 派发前的 main 脏文件基线：collect 阶段只报「派发后新增」的越界改动
+        try:
+            self._dirty_before_dispatch = set(self.git.status_paths())
+        except Exception:  # noqa: BLE001 —— 基线取不到就不做增量过滤（从严）
+            self._dirty_before_dispatch = None
         result = self.dispatcher.dispatch(
             spec,
             reviewer=self._review_diff,
@@ -724,6 +748,40 @@ class Orchestrator:
         )
         self._push_best_effort()
         return E_OK
+
+    def _collect_escape_check(self) -> list[str]:
+        """COLLECTING 阶段**无条件**检查 worktree 之外是否被改动。
+
+        为什么必须无条件：实测 `opencode run` 不传 `--auto` 时 write 工具**照样**
+        真实落盘（本次 status 仍是 completed 并创建了文件），所以 shell 权限位/
+        `--auto` 开关都**不能**当作安全前提 —— 事后 `git status --porcelain`
+        是唯一可靠的防线。这里不看任何 flag，每个成功轮次进 COLLECTING 前都跑。
+
+        只报「相对派发前基线**新增**」的改动（`_dirty_before_dispatch`），
+        并放行编排器自己的记账/证据目录（`COLLECT_OWN_PREFIXES`）。
+        """
+        dirty = self.git.status_paths()
+        baseline = self._dirty_before_dispatch or set()
+        violations: list[str] = []
+        for raw in dirty:
+            path = raw.replace("\\", "/")
+            if path in baseline:
+                continue
+            if any(path.startswith(prefix) for prefix in COLLECT_OWN_PREFIXES):
+                continue
+            violations.append(path)
+        return violations
+
+    def _collect_guard(self, rnd: int, spec: TaskSpec) -> int | None:
+        """无越界返回 None；有越界则记 security_violation -> PAUSE 并返回退出码。"""
+        violations = self._collect_escape_check()
+        if not violations:
+            return None
+        print(
+            f"[PM] COLLECTING 越界检查：worktree 之外新增 {len(violations)} 处改动"
+            f"（{', '.join(violations[:5])}）-> PAUSE"
+        )
+        return self._handle_security_violation(rnd, spec, violations)
 
     # ------------------------------------------------------------------
     # 派活 + 合并（一轮的任务执行）
@@ -806,6 +864,10 @@ class Orchestrator:
                 return False, E_MERGE_CONFLICT
             self.git.worktree_remove(worktree_rel_for(spec))
             self.git.delete_branch(spec.id)
+        # T3/T5：进入 COLLECTING 前无条件跑 main 工作区 porcelain 检查（与 --auto 无关）
+        guard = self._collect_guard(rnd, spec)
+        if guard is not None:
+            return False, guard
         self._transition(LoopPhase.COLLECTING, lock=None)
         more = self._finish_round(rnd, spec=spec, result=result)
         return more, E_OK
@@ -1113,6 +1175,10 @@ class Orchestrator:
         self._transition(
             LoopPhase.DISPATCHING, active_agent="dispatch-agent", task_id=spec.id, lock=lock
         )
+        try:
+            self._dirty_before_dispatch = set(self.git.status_paths())
+        except Exception:  # noqa: BLE001 —— 基线取不到就不做增量过滤（从严）
+            self._dirty_before_dispatch = None
         result = self.dispatcher.dispatch(
             spec, reviewer=self._review_diff, max_rework=self.max_rework,
             phase_hook=self._phase_hook,
@@ -1145,6 +1211,10 @@ class Orchestrator:
                 return E_MERGE_CONFLICT
             self.git.worktree_remove(worktree_rel_for(spec))
             self.git.delete_branch(spec.id)
+        # T5：续跑路径同样无条件做 main 工作区越界检查
+        guard = self._collect_guard(rnd, spec)
+        if guard is not None:
+            return guard
         self._transition(LoopPhase.COLLECTING, lock=None)
         more = self._finish_round(rnd, spec=spec, result=result)
         if more:

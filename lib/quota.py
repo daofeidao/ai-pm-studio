@@ -1,10 +1,12 @@
-"""quota —— QuotaService：OpenCode 额度双源优先级查询（v2 R9 / §7 T04）。
+"""quota —— QuotaService：OpenCode 额度查询（v2 R9 / §7 T04；v2.1 T5 改主源）。
 
-优先级（v2 §2.2 R9）：
-  1. `opencode stats --json --days N --project . --cost`（本地 CLI，零网络依赖）优先；
+优先级（v2.1）：
+  1. **本机 `activity.jsonl` 的 `agent_usage` 累计成本**（NDJSON 流里 step_finish
+     的 part.cost 累加，零子进程、即时）优先，按 `monthly_budget_usd` 折算 percent；
+  2. `opencode stats --json --days N --project . --cost`（本地 CLI，事后汇总）兜底；
      按 `monthly_budget_usd` 折算 percent；budget=0 时返回 None 让位下一源（Q2）。
-  2. HTTP `GET https://opencode.ai/zen/go/v1/usage` 兜底；取 5h/周/月 max percent。
-  3. 两源都失败 -> QuotaInfo(stale=True)，**不拦截**（放行继续派活）。
+  3. HTTP `GET https://opencode.ai/zen/go/v1/usage` 兜底；取 5h/周/月 max percent。
+  4. 全部失败 -> QuotaInfo(stale=True)，**不拦截**（放行继续派活）。
 
 60s 内存缓存（cache_s）；demo 模式直接返回 demo_fixtures.DEMO_QUOTA。
 HTTP 一律标准库 urllib.request；异常全部吞掉转 stale，绝不 raise 断主流程。
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -125,6 +128,8 @@ class QuotaService:
         self.demo_percent: float = float(
             q.get("demo_quota_percent", 22) if demo_percent is None else demo_percent
         )
+        #: 用量账本（NDJSON，`agent_usage` 事件由 OpenCodeProvider 追加）
+        self.activity_path: Path = Path(__file__).resolve().parents[1] / "activity.jsonl"
 
     # ------------------------------------------------------------------
 
@@ -148,7 +153,7 @@ class QuotaService:
         now = time.monotonic()
         if not force and self._cache is not None and (now - self._cache_at) < self.cache_s:
             return self._cache
-        info = self._from_stats_cli(".") or self._from_usage_http()
+        info = self._from_activity() or self._from_stats_cli(".") or self._from_usage_http()
         if info is None:
             info = QuotaInfo(
                 agent="opencode",
@@ -175,8 +180,51 @@ class QuotaService:
             stale=bool(d.get("stale", False)),
         )
 
+    def _from_activity(self, activity_path: Path | None = None) -> QuotaInfo | None:
+        """主源：本机 activity.jsonl 里 `agent_usage` 的累计成本（零子进程、即时）。
+
+        数据来自 NDJSON 流 `step_finish.part.cost` 的累加（`OpenCodeProvider._record_usage`）。
+        没有 usage 事件 / budget<=0 时返回 None，让位给 stats CLI（保持旧行为可回退）。
+        """
+        path = activity_path or self.activity_path
+        if not path.exists():
+            return None
+        total = 0.0
+        found = False
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("kind") != "agent_usage":
+                    continue
+                cost = event.get("cost_usd")
+                if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+                    continue
+                total += float(cost)
+                found = True
+        except OSError:
+            return None
+        if not found:
+            return None
+        budget = float(self.cfg.get("opencode", {}).get("monthly_budget_usd", 0) or 0)
+        if budget <= 0:
+            return None
+        percent = min(100.0, total / budget * 100.0)
+        return QuotaInfo(
+            agent="opencode",
+            max_percent=percent,
+            windows={"month": percent},
+            source="opencode-activity",
+            fetched_at=utc_now_iso(),
+            stale=False,
+        )
+
     def _from_stats_cli(self, project: str) -> QuotaInfo | None:
-        """本地 stats CLI（零网络依赖优先源）。"""
+        """本地 stats CLI（事后汇总兜底源）。"""
         oc = self.cfg.get("opencode", {})
         exe = oc.get("exe", "")
         if not exe:
@@ -261,6 +309,7 @@ def _selftest() -> int:
     cfg_bad["opencode"]["exe"] = "pm-no-such-opencode.exe"
     cfg_bad["quota"]["usage_url"] = "http://127.0.0.1:1/never"
     svc3 = QuotaService(cfg_bad)
+    svc3.activity_path = Path(tempfile.gettempdir()) / "pm-no-such-activity.jsonl"
     i1 = svc3.fetch()
     t_second = time.monotonic()
     i2 = svc3.fetch()
@@ -288,7 +337,30 @@ def _selftest() -> int:
     )
     checks.append(("usage 取不到 -> None", percent_from_usage_data({"foo": 1}) is None))
 
-    # 4) 演示假额度字典
+    # 4) activity 主源（v2.1）：agent_usage 累计成本 -> percent
+    act = Path(tempfile.mkdtemp(prefix="pm-quota-act-")) / "activity.jsonl"
+    act.write_text(
+        '{"ts":"t1","kind":"agent_usage","cost_usd":2.5,"tokens":{"input":10}}\n'
+        '{"ts":"t2","kind":"agent_usage","cost_usd":2.5,"tokens":{"input":20}}\n'
+        '{"ts":"t3","kind":"phase","to":"DONE"}\n',
+        encoding="utf-8",
+    )
+    cfg_budget = json.loads(json.dumps(cfg))
+    cfg_budget["opencode"]["monthly_budget_usd"] = 10
+    info_act = QuotaService(cfg_budget)._from_activity(act)
+    checks.append(("activity 累计成本 5/10 -> 50%（source=opencode-activity）",
+                   info_act is not None and abs(info_act.max_percent - 50.0) < 1e-9
+                   and info_act.source == "opencode-activity"))
+    empty = act.parent / "empty.jsonl"
+    empty.write_text('{"ts":"t","kind":"phase"}\n', encoding="utf-8")
+    checks.append(("无 agent_usage 事件 -> 让位 stats（None）",
+                   QuotaService(cfg_budget)._from_activity(empty) is None))
+    cfg_zero = json.loads(json.dumps(cfg_budget))
+    cfg_zero["opencode"]["monthly_budget_usd"] = 0
+    checks.append(("activity 源 budget=0 -> 让位（None）",
+                   QuotaService(cfg_zero)._from_activity(act) is None))
+
+    # 5) 演示假额度字典
     checks.append(("DEMO_QUOTA_EXCEEDED 超降级线", DEMO_QUOTA_EXCEEDED["max_percent"] > 90))
     checks.append(("DEMO_QUOTA_STALE stale=True", DEMO_QUOTA_STALE["stale"] is True))
 

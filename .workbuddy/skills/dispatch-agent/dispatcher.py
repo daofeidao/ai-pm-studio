@@ -560,24 +560,42 @@ def _selftest() -> int:
         parsed = ap.parse_opencode_json(DEMO_OPENCODE_JSON)
         checks.append(("parse_opencode_json text 非空", bool(parsed.summary.strip())))
         checks.append(("parse_opencode_json sessionID 提取", parsed.session_id == "ses_demo_001"))
+        checks.append(("parse_opencode_json token/cost 累计",
+                       parsed.tokens.get("input") == 1200 and parsed.tokens.get("output") == 300
+                       and abs(parsed.cost_usd - 0.0042) < 1e-9))
         raw_path = tmp / "reports" / "opencode-task-103-raw.json"
         checks.append(("raw 落盘 reports/opencode-<id>-raw.json", raw_path.exists()))
 
-        # --- T5：NDJSON 流式解析（真实样本形态：多行 JSON，逐行输出）---
+        # --- T5：NDJSON 流式解析（真实形态：payload 在 part，step_finish 后有 text）---
         ndjson_stream = (
-            '{"type":"step_start","sessionID":"ses_stream_1","timestamp":"2026-10-20T11:35:00Z"}\n'
-            '{"type":"text","sessionID":"ses_stream_1","text":"第一段："}\n'
-            '{"type":"text","sessionID":"ses_stream_1","text":"第二段内容"}\n'
-            '{"type":"step_finish","sessionID":"ses_stream_1","tokens":{"input":10,"output":5}}\n'
+            '{"type":"step_start","sessionID":"ses_stream_1","part":{"type":"step-start"}}\n'
+            '{"type":"tool_use","sessionID":"ses_stream_1","part":{"tool":"write","state":{"status":"completed"}}}\n'
+            '{"type":"step_finish","sessionID":"ses_stream_1","part":{"tokens":{"input":10,"output":5}}}\n'
+            '{"type":"text","sessionID":"ses_stream_1","part":{"text":"第一段："}}\n'
+            '{"type":"text","sessionID":"ses_stream_1","part":{"text":"第二段内容"}}\n'
         )
         st = ap.parse_opencode_json(ndjson_stream)
         checks.append(("NDJSON 流式解析：多段 text 全部累加",
                        "第一段" in st.summary and "第二段内容" in st.summary))
+        checks.append(("NDJSON 流式解析：step_finish 后的 text 仍被取到",
+                       st.text == "第一段：第二段内容"))
         checks.append(("NDJSON 流式解析：sessionID 提取", st.session_id == "ses_stream_1"))
-        # 单行 JSON 对象（整串可解析）
-        single = '{"type":"text","sessionID":"ses_single","text":"唯一一段"}'
+        checks.append(("NDJSON 流式解析：工具调用与 token 提取",
+                       len(st.tool_calls) == 1 and st.tool_calls[0]["ok"] is True
+                       and st.tokens == {"input": 10, "output": 5}))
+        # 单行 JSON 事件（整行可解析）
+        single = '{"type":"text","sessionID":"ses_single","part":{"text":"唯一一段"}}'
         s1 = ap.parse_opencode_json(single)
-        checks.append(("单 JSON 对象解析正常", s1.summary == "唯一一段" and s1.session_id == "ses_single"))
+        checks.append(("单行 JSON 事件解析正常", s1.text == "唯一一段" and s1.session_id == "ses_single"))
+        # 真实样本回放（reports/t5/sample-result.json，逐字校验）
+        fixture = (ROOT / "reports" / "t5" / "sample-result.json").read_text(encoding="utf-8")
+        replay = ap.parse_opencode_json(fixture)
+        checks.append(("真实样本回放：文本逐字一致",
+                       replay.text == "OK\n\n已写入 C:\\temp\\octest\\a.txt，内容为 hello。"))
+        checks.append(("真实样本回放：write/completed + token 累计",
+                       len(replay.tool_calls) == 1 and replay.tool_calls[0]["tool"] == "write"
+                       and replay.tool_calls[0]["ok"] is True
+                       and replay.tokens == {"input": 5145, "output": 44, "reasoning": 26}))
         # 空 stdout -> E_OPENCODE_BAD_JSON
         try:
             ap.parse_opencode_json("")

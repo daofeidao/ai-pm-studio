@@ -65,3 +65,10 @@
 - 报告路径：reports/qa-demo-20261020T185311.md
 - 建议下一步：同前一条（LeanREA → 17 态 → Magpie 联调）。
 - 备注：仅影响本地临时目录，不改断言与业务逻辑。
+## ↪ Return · 2026-10-20T11:11:32Z · pm-orchestrator(T5 解析器)
+- 做了什么：按真实 `opencode run --format json` 输出重写 `parse_opencode_json` —— ①逐行 json.loads、坏行跳过、读到 EOF 才结束；②`step_finish` 不作完成信号（实测其后仍有 text）；③文本取全部 `type=="text"` 的 `part.text` 顺序拼接；④工具调用取 `part.tool`/`part.state`，非 completed 记 `ok=false`；⑤`step_finish` 的 `part.tokens`/`part.cost` 累计，经 `OpenCodeProvider._record_usage` 写入 `activity.jsonl`（`agent_usage`），并新增 `QuotaService._from_activity` 作额度主源（stats 降为兜底）；⑥COLLECTING 前**无条件**跑 main 工作区 `git status --porcelain`（不看 `--auto`，只报相对派发前基线新增的越界，命中即 security_violation -> PAUSE）。
+- 改动文件：lib/agent_provider.py；lib/quota.py；lib/demo_fixtures.py；.workbuddy/skills/dispatch-agent/dispatcher.py；.workbuddy/skills/pm-orchestrator/orchestrator.py；docs/opencode-json-sample.md；reports/t5/sample-result.json
+- 测试结果：`agent_provider --selftest` 14/14（回放文本逐字一致、write/completed、token 5145/44/26、step_finish 后 text 仍在、坏行跳过、失败工具、cost 累加、老形态兼容）；`dispatcher --selftest` 全绿（含真实夹具回放断言）；`quota --selftest` 16/16（activity 5/10 -> 50%）；demo QA 四场景 46/46 仍全绿；`_collect_escape_check` 单测：越界必报 / 记账放行 / 基线豁免 / 无基线从严。
+- 报告路径：reports/t5/sample-result.json
+- 建议下一步：按序 —— ①在线复采 1 次校准 `part.cost` 与异常形态 → ②LeanREA 逆向路由接线 → ③17 态审查表落地（先合并候选态）→ ④Magpie 真实网关联调（需在线）。
+- 备注：夹具 4 行按已确认的事件顺序与字段固化（仓库内未留存原始捕获文件；`part.cost` 真实数值未采集，置 0，累加逻辑由自检合成用例覆盖）；被替换的旧 `sample-result.json`（无凭证超时元数据）仍保留在 git 历史中。
