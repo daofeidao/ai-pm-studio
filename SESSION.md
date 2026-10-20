@@ -96,3 +96,10 @@
 - E2E 结果：**9/9 PASS**，总耗时 13.5s（第一跳 6.2s / 派发 0.6s / 第二跳 6.3s）。报告 `reports/e2e-loop-001.md` 含两次提问与回答原文、解析出的 JSON 指令、worktree 与提交、记忆包、回传后回答、验收点表。
 - 测试：`web_ai.py --selftest` 全绿（新增“Edge 自愈参数齐全”断言）；E2E 9/9。
 - 备注：E2E 每跑一次消耗 2 次网页提问（可重复跑，报告覆盖同一文件）；`reports/webai-deepseek-*.md` 为运行时产物已列入 `.gitignore`（证据已内嵌进 e2e 报告）；沙箱仓库留在 `%TEMP%\pm-e2e-loop-*`，可随时删除。
+## ↪ Return · 2026-10-20T17:05:14Z · opencode
+- 做了什么：桌面壳收口 —— ①新增「执行引擎」下拉（网页 AI 直驱 / 本地 OpenCode）；②强制拦截截断输出（含省略号、<100 字节、HTML 缺 </html>、Python 语法错 → FAILED，不落盘、不打开）；③按代码类型分流（html → work/app.html + 浏览器；python → work/script.py + _find_python 执行）；④「产物目录」按钮只打开文件夹，不再直接运行产物；⑤prompt 换全栈版并区分 ```html / ```python；⑥web_ai.timeout_s 120→300（带深度思考时 120s 必超时）。
+- 改动文件：desktop_app.py；pm.config.json（web_ai.timeout_s=300）；SESSION.md
+- 测试结果：拦截单测 6/6（html_trunc / html_noend / py_bad / short 全拦下，正常 html/python 放行）；网页引擎 python 任务 DONE；OpenCode 引擎 python 任务 DONE（1^2..10^2 输出正确）；OpenCode 引擎贪吃蛇产出 27.9KB 完整 HTML（DOCTYPE 与 </html> 齐全，已用浏览器打开）；exe 重打包后 8080 正常，UI 含引擎下拉与「产物目录」按钮。
+- 报告路径：（无）
+- 建议下一步：上传 exe 到 Release 并发送交付邮件；把「Edge 调试实例窗口尺寸」与「网页输出截断」两条经验并入 MEMORY.md
+- 备注：dist/PM-Studio.exe 11.85MB sha256 35787E6038B0379B56CCCFAC584391D34B4B6F56539B740996ED9BEB2AE5B8A3

@@ -57,7 +57,7 @@
     "provider": "deepseek",
     "chat_url": "https://chat.deepseek.com",
     "cdp_py": "C:/Users/lion/.workbuddy/skills/browser-automation-cdp/scripts/cdp.py",
-    "timeout_s": 120,
+    "timeout_s": 300,
     "poll_s": 3,
     "debug_port": 9222,
     "edge_exe": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
