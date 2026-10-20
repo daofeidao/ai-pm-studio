@@ -39,5 +39,15 @@
       "reason": "探测接口未确认（enabled=null，不阻塞主流程）",
       "at": "2026-10-20T05:56:07Z"
     }
-  ]
+  ],
+  "reverse_toolchain": {
+    "asar": { "present": false },
+    "jadx": { "present": false },
+    "apktool": { "present": false },
+    "otool": { "present": false },
+    "nm": { "present": false },
+    "go": { "present": false },
+    "rg": { "present": false },
+    "ghidra": { "present": false }
+  }
 }

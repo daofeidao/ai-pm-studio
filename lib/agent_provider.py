@@ -70,7 +70,7 @@ def detect_irreversible_ops(text: str) -> list[str]:
 
 @dataclass
 class TaskSpec:
-    """派活任务书（v2 增加 acceptance / allowed_paths）。"""
+    """派活任务书（v2 增加 acceptance / allowed_paths；v2.1 增加 reverse_target）。"""
 
     id: str = "task-000"
     instruction: str = ""
@@ -78,6 +78,7 @@ class TaskSpec:
     script_route: str | None = None
     acceptance: list[str] = field(default_factory=list)
     allowed_paths: list[str] = field(default_factory=lambda: ["work/"])
+    reverse_target: str | None = None  # v2.1：逆向任务的目标文件路径（dispatcher 复制到 worktree 副本）
 
 
 @dataclass

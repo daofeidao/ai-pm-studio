@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import fnmatch
+import re
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,6 +162,11 @@ class Dispatcher:
         self.degrade_percent = float(cfg.get("quota", {}).get("degrade_percent", 90))
         self.last_route: str | None = None      # script / workbuddy / opencode
         self.last_diff: list[str] = []
+        # v2.1 逆向路由状态（供测试与看板断言）
+        self.reverse_loaded: bool = False        # 是否注入 leanrea 路由表
+        self.reverse_copied_to: list[str] = []    # 复制到 worktree 副本的路径
+        self.reverse_targets: list[str] = []      # 检测到的逆向目标
+        self._reverse_prepared: bool = False      # 防重复复制/注入
 
     # ------------------------------------------------------------------
 
@@ -189,6 +196,83 @@ class Dispatcher:
         if self.demo:
             return list(result.artifacts)
         return self.git.status_paths()
+
+    # ------------------------------------------------------------------
+    # v2.1 逆向路由（LeanREA）
+    # ------------------------------------------------------------------
+
+    _REVERSE_EXTS = (".asar", ".apk", ".dll", ".elf", ".exe", ".bin", ".img",
+                     ".dex", ".so", ".dylib", ".app", ".ipa", "firmware")
+    _REVERSE_KEYWORDS = ("逆向", "反编译", "解包", "reverse", "decompile",
+                         "electron", "固件", "binary analysis", "mach-o", "逆向工程")
+
+    def _extract_path_tokens(self, instruction: str) -> list[str]:
+        """从指令里按空白/引号切出疑似文件路径的 token（鲁棒，兼容 8.3 短路径）。"""
+        out: list[str] = []
+        for tok in re.split(r'[\s"\']+', instruction or ""):
+            tok = tok.strip().strip(".,;:")
+            if not tok:
+                continue
+            low = tok.lower()
+            if any(low.endswith(e) for e in self._REVERSE_EXTS if e.startswith(".")):
+                out.append(tok)
+            elif re.match(r"^[A-Za-z]:[\\/]", tok) or tok.startswith("/"):
+                out.append(tok)
+        return out
+
+    def _detect_reverse(self, instruction: str, reverse_target: str | None = None) -> tuple[bool, str]:
+        """判定是否逆向任务；返回 (is_reverse, target_path)。"""
+        text = (instruction or "").lower()
+        paths = self._extract_path_tokens(instruction)
+        path_hit = paths[0] if paths else None
+        is_rev = (
+            any(e in text for e in self._REVERSE_EXTS)
+            or any(k in text for k in self._REVERSE_KEYWORDS)
+            or bool(path_hit)
+            or bool(reverse_target)
+        )
+        target = reverse_target or path_hit or ""
+        return is_rev, target
+
+    def _maybe_reverse(self, task: TaskSpec, instruction: str) -> str:
+        """逆转路由处理：检测 -> 复制副本 -> 注入 leanrea 指令。
+
+        仅执行一次（self._reverse_prepared 守卫）。返回（可能带逆向注入前缀的）instruction。
+        """
+        is_rev, target = self._detect_reverse(instruction, task.reverse_target)
+        if not is_rev:
+            return instruction
+        self.reverse_loaded = True
+        if target:
+            self.reverse_targets = [target]
+        if self._reverse_prepared:
+            return instruction
+
+        wt_rel = worktree_rel_for(task)
+        wt = self.root / wt_rel
+        if not wt.exists():
+            wt = self.git.worktree_add(wt_rel, task.id, self.git.default_branch)
+        copy_dir = wt / "_reverse" / "copy"
+        copy_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[str] = []
+        candidates = [target] if target else []
+        for tok in self._extract_path_tokens(instruction):
+            if tok not in candidates:
+                candidates.append(tok)
+        for cand in candidates:
+            p = Path(cand)
+            if p.exists() and p.is_file():
+                dest = copy_dir / p.name
+                shutil.copy2(p, dest)
+                copied.append(str(dest.relative_to(self.root)))
+        self.reverse_copied_to = copied
+        self._reverse_prepared = True
+        inj = (
+            "请先读取 .opencode/skills/leanrea/SKILL.md，按其「路由表」为本次逆向目标选择首条命令；"
+            "务必先把目标文件复制到 worktree 副本（worktrees/%s/_reverse/copy/）再对副本操作，"
+            "绝不触碰原始路径。" % task.id
+        )
+        return f"{instruction}\n【逆向侦察】{inj}"
 
     def _run_script(self, route: Route, wt: Path, task: TaskSpec) -> AgentResult:
         """script 路由执行：cwd=worktree，环境变量 PM_OUTPUT_DIR=<wt>/work（Q6 约定）。"""
@@ -263,6 +347,8 @@ class Dispatcher:
     ) -> AgentResult:
         """单次派发（三段式）。"""
         instruction = task.instruction if not feedback else f"{task.instruction}\n【打回反馈】{feedback}"
+        # v2.1 逆向路由：检测 + 复制到 worktree 副本 + 注入 leanrea 指令（仅一次）
+        instruction = self._maybe_reverse(task, instruction)
 
         # ① 脚本优先（零 LLM）
         route = self.router.match(instruction)
@@ -286,9 +372,16 @@ class Dispatcher:
 
         # ③ OpenCode（worktree 隔离）
         self.last_route = "opencode"
-        if phase_hook:
-            phase_hook("PREPARING_WORKTREE")
-        wt = self.git.worktree_add(worktree_rel_for(task), task.id, self.git.default_branch)
+        wt_rel = worktree_rel_for(task)
+        wt = self.root / wt_rel
+        if not wt.exists():
+            if phase_hook:
+                phase_hook("PREPARING_WORKTREE")
+            wt = self.git.worktree_add(wt_rel, task.id, self.git.default_branch)
+        else:
+            # 逆向已预建 worktree（含 _reverse/copy 副本），不重建以免丢失副本
+            if phase_hook:
+                phase_hook("PREPARING_WORKTREE")
         if phase_hook:
             phase_hook("EXECUTING")
         provider = self._provider("opencode")
@@ -422,8 +515,36 @@ def _selftest() -> int:
         cmd_cont = oc_provider.build_command(spec3, tmp / "wt", tmp / "TASK.md", session_id="ses_x", continue_last=True)
         checks.append(("build_command 支持 --session/--continue", "--session" in cmd_cont and "--continue" in cmd_cont))
 
+        # --- 分支④：逆向路由（LeanREA）注入 + 复制副本 + 原文件不改 ---
+        disp4 = Dispatcher(tmp, cfg, git, demo=True)
+        target_apk = tmp / "dist" / "app.apk"
+        target_apk.parent.mkdir(parents=True, exist_ok=True)
+        target_apk.write_text("PK\x03\x04 fake apk bytes\n", encoding="utf-8")
+        orig_mtime = target_apk.stat().st_mtime_ns
+        spec4 = TaskSpec(
+            id="task-104",
+            instruction=f"逆向分析安装包 {target_apk} 并反编译其中的逻辑",
+            acceptance=["file_exists:work/reverse-report.md"],
+            allowed_paths=["work/"],
+        )
+        result4 = disp4.dispatch(spec4)
+        checks.append(("逆向任务注入 leanrea（reverse_loaded=True）", disp4.reverse_loaded is True))
+        checks.append(("逆向任务复制目标到 worktree 副本", len(disp4.reverse_copied_to) >= 1))
+        copy_path = tmp / disp4.reverse_copied_to[0] if disp4.reverse_copied_to else None
+        checks.append(("副本落在 worktrees/task-104/_reverse/copy", bool(copy_path) and "task-104/_reverse/copy" in str(copy_path)))
+        checks.append(("原文件未被改动（mtime 不变）", target_apk.stat().st_mtime_ns == orig_mtime))
+        checks.append(("逆向 OC 全链路成功", result4.status == "success"))
+        git.worktree_remove(worktree_rel_for(spec4))
+        git.delete_branch("task-104")
+
+        # --- 分支⑤：普通任务不加载 leanrea ---
+        disp5 = Dispatcher(tmp, cfg, git, demo=True)
+        spec5 = TaskSpec(id="task-105", instruction="演示任务：生成登录页", acceptance=["file_exists:work/demo-login.html"], allowed_paths=["work/"])
+        disp5.dispatch(spec5)
+        checks.append(("普通任务不加载 leanrea（reverse_loaded=False）", disp5.reverse_loaded is False))
+
         checks.append(("全程主工作区保持 main", git.current_branch() == "main"))
-        checks.append(("全程无 task worktree 残留", not (tmp / "worktrees" / "task-101").exists() and not (tmp / "worktrees" / "task-103").exists()))
+        checks.append(("全程无 task worktree 残留", not (tmp / "worktrees" / "task-101").exists() and not (tmp / "worktrees" / "task-103").exists() and not (tmp / "worktrees" / "task-104").exists()))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

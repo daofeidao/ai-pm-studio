@@ -22,6 +22,25 @@ EXTERNAL_AGENTS: tuple[str, ...] = ("dsh", "openclaw", "codebuddy")
 #: 探测不到时的默认原因
 GAP_REASON = "探测接口未确认（enabled=null，不阻塞主流程）"
 
+#: v2.1 逆向工具链探测（缺失记 capability_gap，不阻塞，降级通用 OpenCode）
+REVERSE_TOOLCHAIN: tuple[str, ...] = (
+    "asar", "jadx", "apktool", "otool", "nm", "go", "rg", "ghidra",
+)
+
+
+def _tool_present(exe: str) -> bool:
+    """探测某 CLI 工具是否在 PATH（零网络；异常吞掉）。"""
+    try:
+        proc = run_cli([exe, "--version"], timeout_s=20)
+        return proc.returncode == 0
+    except Exception:
+        # 退一步：仅查 which/where
+        try:
+            probe = run_cli(["where", exe] if sys.platform == "win32" else ["which", exe], timeout_s=20)
+            return probe.returncode == 0
+        except Exception:
+            return False
+
 
 class CapabilityProbe:
     """能力探测：写 capabilities.json，失败只记 gaps 不 raise。"""
@@ -71,6 +90,20 @@ class CapabilityProbe:
             caps["agents"][name] = {"enabled": None, "kind": "external"}
             caps["capability_gaps"].append({"agent": name, "reason": GAP_REASON, "at": utc_now_iso()})
 
+        # v2.1 逆向工具链探测（不阻塞，缺失记 capability_gap，降级通用 OpenCode）
+        rev: dict[str, Any] = {}
+        rev_gaps: list[str] = []
+        for tool in REVERSE_TOOLCHAIN:
+            present = _tool_present(tool)
+            rev[tool] = {"present": present}
+            if not present:
+                rev_gaps.append(tool)
+        caps["reverse_toolchain"] = rev
+        if rev_gaps:
+            caps["capability_gaps"].append(
+                {"agent": "reverse_toolchain", "reason": f"缺失工具: {', '.join(rev_gaps)}（降级通用 OpenCode）", "at": utc_now_iso()}
+            )
+
         atomic_write_json(self.out_path, caps)
         return caps
 
@@ -100,6 +133,10 @@ def _selftest() -> int:
         )
         checks.append(
             ("capability_gaps 有记录", len(caps.get("capability_gaps", [])) >= len(EXTERNAL_AGENTS))
+        )
+        checks.append(
+            ("reverse_toolchain 已探测", isinstance(caps.get("reverse_toolchain"), dict)
+             and set(caps["reverse_toolchain"].keys()) == set(REVERSE_TOOLCHAIN))
         )
         checks.append(
             ("capabilities.json 已写回", (tmp / "capabilities.json").exists())
